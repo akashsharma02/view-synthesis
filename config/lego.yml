@@ -23,7 +23,7 @@ dataset:
   # Base directory of dataset.
   basedir: /home/fyusion/Documents/datasets/nerf_synthetic/lego
   # Training batch size (number of images to sample per training step)
-  train_batch_size: 1
+  train_batch_size: 2
   # Validation batch size (number of images to sample per validation step
   val_batch_size: 1
   # For the Blender datasets (synthetic), optionally return images
