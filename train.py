@@ -111,8 +111,11 @@ def prepare_optimizer(rank: int, cfg: CfgNode, models: "OrderedDict[str, torch.n
         trainable_params += models[model_name].parameters()
     optimizer = getattr(torch.optim, cfg.optimizer.type)(
         trainable_params, lr=cfg.optimizer.lr)
-    scheduler = getattr(torch.optim.lr_scheduler, cfg.optimizer.scheduler_type)(
-        optimizer=optimizer, **cfg.optimizer.scheduler_args)
+    # TODO: Define custom scheduler which handles this from config
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 0.1 ** (epoch / cfg.experiment.train_iters))
+
+    # scheduler = getattr(torch.optim.lr_scheduler, cfg.optimizer.scheduler_type)(
+    #     optimizer=optimizer, **cfg.optimizer.scheduler_args)
     return optimizer, scheduler
 
 
@@ -268,10 +271,11 @@ def train(rank: int, cfg: CfgNode) -> None:
                                 rgb[..., :3], target_pixels[..., :3])
 
         loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
+
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
         scheduler.step()
+        optimizer.zero_grad()
 
         psnr = mse2psnr(loss.item())
         if i % cfg.experiment.print_every == 0 or i == cfg.experiment.train_iters - 1:
@@ -362,7 +366,7 @@ def main(cfg: CfgNode):
 
     """
     # # (Optional:) enable this to track autograd issues when debugging
-    torch.autograd.set_detect_anomaly(True)
+    # torch.autograd.set_detect_anomaly(True)
 
     # Seed experiment for repeatability
     seed = cfg.experiment.randomseed

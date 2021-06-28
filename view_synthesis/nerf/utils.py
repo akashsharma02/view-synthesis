@@ -78,8 +78,7 @@ class RaySampler(object):
         ray_origins, ray_directions = self.get_bundle(tform_cam2world)
         ro, rd = ray_origins.reshape(-1, 3), ray_directions.reshape(-1, 3)
 
-        rng = np.random.default_rng()
-        select_inds = rng.choice(
+        select_inds = np.random.choice(
             ro.shape[-2], size=(
                 self.sample_size*batch_size), replace=False
         )
@@ -215,6 +214,7 @@ class PointSampler(object):
         samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
 
         z_samples = samples.detach()
+
         z_vals, _ = torch.sort(torch.cat((z_vals, z_samples), dim=-1), dim=-1)
         pts = ro[..., None, :] + rd[..., None, :] * z_vals[..., :, None]
 
@@ -286,7 +286,6 @@ def get_embedding_function(
     return lambda x, progress=1.0: positional_encoding(
         x, num_encoding_functions, include_input, log_sampling, progress
     )
-
 
 if __name__ == "__main__":
     import argparse
