@@ -226,20 +226,19 @@ def train(rank: int, cfg: CfgNode) -> None:
                 train_data[key] = train_data[key].to(device)
 
         then = time.time()
-        ray_origins, ray_directions, select_inds = ray_sampler.sample(
+        ro, rd, select_inds = ray_sampler.sample(
             tform_cam2world=train_data["pose"])
-        ro, rd = ray_origins.T, ray_directions.T
 
         target_pixels = train_data["color"].view(-1, 4)[select_inds, :]
         weights, viewdirs, pts, z_vals = None, None, None, None
-        loss = None
-        for _, model in models.items():
+        coarse_loss, fine_loss = None, None
+        for model_name, model in models.items():
 
             if weights == None:
                 pts, z_vals = point_sampler.sample_uniform(ro, rd)
             else:
                 pts, z_vals = point_sampler.sample_pdf(ro, rd, weights[..., 1:-1])
-            pts_flat = pts.view(-1, 3)
+            pts_flat = pts.reshape(-1, 3)
 
             embedded = embedxyz_fn(pts_flat)
             if cfg.nerf.use_viewdirs:
@@ -261,13 +260,14 @@ def train(rank: int, cfg: CfgNode) -> None:
                 rd,
                 white_background=getattr(cfg.nerf, "train").white_background)
 
-            if loss is None:
-                loss = torch.nn.functional.mse_loss(
+            if model_name == "coarse":
+                coarse_loss = torch.nn.functional.mse_loss(
                                 rgb[..., :3], target_pixels[..., :3])
             else:
-                loss += torch.nn.functional.mse_loss(
+                fine_loss = torch.nn.functional.mse_loss(
                                 rgb[..., :3], target_pixels[..., :3])
 
+        loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
@@ -295,13 +295,14 @@ def train(rank: int, cfg: CfgNode) -> None:
                 ro_batches = get_minibatches(ro, cfg.nerf.validation.chunksize)
                 rd_batches = get_minibatches(rd, cfg.nerf.validation.chunksize)
 
-                coarse_pixels, fine_pixels = [], []
-                loss = None
+                rgb_coarse, rgb_fine = [], []
+                coarse_loss, fine_loss = None, None
                 val_then = time.time()
+                # TODO: Clean this shit up
                 for ro, rd in zip(ro_batches, rd_batches):
                     weights, viewdirs, pts, z_vals = None, None, None, None
-                    for _, model in models.items():
-                        if weights == None:
+                    for model_name, model in models.items():
+                        if model_name == "coarse":
                             pts, z_vals = point_sampler.sample_uniform(ro, rd)
                         else:
                             pts, z_vals = point_sampler.sample_pdf(ro, rd, weights[..., 1:-1])
@@ -327,30 +328,31 @@ def train(rank: int, cfg: CfgNode) -> None:
                             z_vals,
                             rd,
                             white_background=getattr(cfg.nerf, "train").white_background)
-
-                        if radiance_field.shape[-2] == cfg.nerf.train.num_coarse:
-                            coarse_pixels.append(rgb)
+                        if model_name == "coarse":
+                            rgb_coarse.append(rgb)
                         else:
-                            fine_pixels.append(rgb)
+                            rgb_fine.append(rgb)
 
-                rgb_coarse = torch.cat(coarse_pixels, dim=0)
-                rgb_fine = torch.cat(fine_pixels, dim=0)
+                rgb_coarse = torch.cat(rgb_coarse, dim=0)
+                rgb_fine = torch.cat(rgb_fine, dim=0)
 
-                if loss is None:
-                    loss = torch.nn.functional.mse_loss(
-                                    rgb_coarse[..., :3], target_pixels[..., :3])
-                else:
-                    loss += torch.nn.functional.mse_loss(
-                                    rgb_fine[..., :3], target_pixels[..., :3])
+                coarse_loss = torch.nn.functional.mse_loss(
+                                rgb_coarse[..., :3], target_pixels[..., :3])
+                fine_loss = torch.nn.functional.mse_loss(
+                                rgb_fine[..., :3], target_pixels[..., :3])
+                loss = 0.0
+                loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
                 psnr = mse2psnr(loss.item())
-                rgb_fine = rgb_fine.reshape(list(val_data["color"].shape[:-1]) + [3])
-                # print(val_data["color"].permute(2, 0, 1).shape)
+
+                rgb_fine = rgb_fine.reshape(list(val_data["color"].shape[:-1]) + [rgb_fine.shape[-1]])
+                target_rgb = target_pixels.reshape(list(val_data["color"].shape[:-1]) + [4])
+
                 wandb.log({"validation/loss": loss.item(),
                            "validation/psnr": psnr,
-                           "validation/rgb": [wandb.Image(rgb_fine[i, ..., :3].permute(2, 0, 1)) for i in range(rgb_fine.shape[0])]
+                           "validation/rgb": [wandb.Image(rgb_fine[i, ...].permute(2, 0, 1)) for i in range(rgb_fine.shape[0])],
+                           "validation/target": [wandb.Image(target_rgb[i, ..., :3].permute(2, 0, 1)) for i in range(val_data["color"].shape[0])]
                            })
-                # wandb.log({"validation/target": [wandb.Image(val_data["color"][i, ..., :3].permute(2, 0, 1) for i in range(val_data["color"].shape[0]))]})
-                print(f"[bold magenta][VAL  ][/bold magenta] Iter: {i:>8} Time taken: {time.time() - then:>4.4f} Loss: {loss.item():>4.4f}, PSNR: {psnr:>4.4f}")
+                print(f"[bold magenta][VAL  ][/bold magenta] Iter: {i:>8} Time taken: {time.time() - val_then:>4.4f} Loss: {loss.item():>4.4f}, PSNR: {psnr:>4.4f}")
 
 def main(cfg: CfgNode):
     """ Main function setting up the training loop

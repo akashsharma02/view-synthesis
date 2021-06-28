@@ -57,7 +57,7 @@ class RaySampler(object):
                 -(jj - height * 0.5) / self.focal_length,
                 -torch.ones_like(ii),
             ],
-            dim=0,
+            dim=-1,
         )
 
     def sample(self, tform_cam2world: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray]:
@@ -76,16 +76,16 @@ class RaySampler(object):
         batch_size = tform_cam2world.shape[0]
 
         ray_origins, ray_directions = self.get_bundle(tform_cam2world)
-        ro, rd = ray_origins.reshape(3, -1), ray_directions.reshape(3, -1)
+        ro, rd = ray_origins.reshape(-1, 3), ray_directions.reshape(-1, 3)
 
         rng = np.random.default_rng()
         select_inds = rng.choice(
-            ro.shape[-1], size=(
+            ro.shape[-2], size=(
                 self.sample_size*batch_size), replace=False
         )
 
-        ray_origins = ro[:, select_inds]
-        ray_directions = rd[:, select_inds]
+        ray_origins = ro[select_inds, :]
+        ray_directions = rd[select_inds, :]
 
         return ray_origins, ray_directions, select_inds
 
@@ -102,13 +102,11 @@ class RaySampler(object):
         """
         ray_directions = torch.tensordot(
             tform_cam2world[..., :3, :3],
-            self.directions,
-            dims=([1], [0])
-        ).contiguous()
+            self.directions.T,
+            dims=([2], [0])
+        ).transpose(1, -1).contiguous()
 
-
-        ray_origins = tform_cam2world[..., :3, -1][..., None, None].expand_as(ray_directions)
-
+        ray_origins = tform_cam2world[..., :3, -1].expand(ray_directions.shape)
         return ray_origins, ray_directions
 
 
