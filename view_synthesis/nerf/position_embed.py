@@ -1,70 +1,58 @@
+from numpy.typing import DTypeLike
 import torch
 import numpy as np
 
-def positional_encoding(
-    tensor, num_encoding_functions=6, include_input=True, log_sampling=True, progress=1.0
-) -> torch.Tensor:
-    r"""Apply positional encoding to the input.
-    Args:
-        tensor (torch.Tensor): Input tensor to be positionally encoded.
-        encoding_size (optional, int): Number of encoding functions used to compute
-            a positional encoding (default: 6).
-        include_input (optional, bool): Whether or not to include the input in the
-            positional encoding (default: True).
-    Returns:
-    (torch.Tensor): Positional encoding of the input tensor.
-    """
-    # TESTED
-    # Trivially, the input tensor is added to the positional encoding.
-    alpha = int(progress * num_encoding_functions)
-    encoding = [tensor] if include_input else []
-    frequency_bands = None
-    if log_sampling:
-        frequency_bands = 2.0 ** torch.linspace(
-            0.0,
-            num_encoding_functions - 1,
-            num_encoding_functions,
-            dtype=tensor.dtype,
-            device=tensor.device,
-        )
-    else:
-        frequency_bands = torch.linspace(
-            2.0 ** 0.0,
-            2.0 ** (num_encoding_functions - 1),
-            num_encoding_functions,
-            dtype=tensor.dtype,
-            device=tensor.device,
-        )
 
-    def get_weight(alpha, k):
-        if alpha < k:
-            weight = 0.0
-        elif alpha - k >= 0 and alpha - k < 1:
-            weight = (1 - torch.cos(torch.tensor((alpha - k) * math.pi))) / 2
+class PositionalEmbedder(object):
+
+    """Positionally encode the input vector through fourier basis with given frequency bands"""
+
+    def __init__(self, num_freq: int, log_sampling: bool, include_input: bool, dtype: DTypeLike, device: torch.cuda.Device) -> None:
+        assert num_freq > 0, "Number of frequency samples should be a positive integer"
+        self.num_freq = num_freq
+        self.log_sampling = log_sampling
+        self.include_input = include_input
+        self.dtype = dtype
+        self.device = device
+
+        self.frequency_bands = None
+        if self.log_sampling:
+            self.frequency_bands = 2.0 ** torch.linspace(
+                0.0,
+                self.num_freq - 1,
+                self.num_freq,
+                dtype=self.dtype,
+                device=self.device,
+            )
         else:
-            weight = 1.0
-        return weight
+            self.frequency_bands = torch.linspace(
+                2.0 ** 0.0,
+                2.0 ** (self.num_freq - 1),
+                self.num_freq,
+                dtype=self.dtype,
+                device=self.device,
+            )
 
-    for i, freq in enumerate(frequency_bands):
-        weight = get_weight(alpha, i)
-        for func in [torch.sin, torch.cos]:
-            encoding.append(weight * func(tensor * freq))
+    def embed(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
 
-    # Special case, for no positional encoding
-    if len(encoding) == 1:
-        return encoding[0]
-    else:
-        return torch.cat(encoding, dim=-1)
+        :function:
+            tensor: torch.Tensor [:, num_dim] Tensor to be positionally embedded
+        :returns:
+            tensor: torch.Tensor [:, num_dim*num_freq*2] Positionally embedded feature vector
 
+        """
+        encoding = [tensor] if self.include_input else []
 
-def get_embedding_function(
-    num_encoding_functions=6, include_input=True, log_sampling=True, alpha=6
-):
-    r"""Returns a lambda function that internally calls positional_encoding.
-    """
-    return lambda x, progress=1.0: positional_encoding(
-        x, num_encoding_functions, include_input, log_sampling, progress
-    )
+        for i, freq in enumerate(self.frequency_bands):
+            for func in [torch.sin, torch.cos]:
+                encoding.append(func(tensor * freq))
+
+        if len(encoding) == 1:
+            return encoding[0]
+        else:
+            return torch.cat(encoding, dim=-1)
+
 
 if __name__ == "__main__":
     # TODO: Test positional embedding

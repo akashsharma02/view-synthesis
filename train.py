@@ -1,13 +1,12 @@
 from typing import Dict, List, Tuple
 import time
 import argparse
-from rich import print
-from rich.progress import track
 import wandb
+from rich.progress import track
+from rich import print
 import yaml
 from pathlib import Path
 from collections import OrderedDict
-import multiprocessing
 
 import numpy as np
 import torch
@@ -19,7 +18,7 @@ from view_synthesis.cfgnode import CfgNode
 import view_synthesis.datasets as datasets
 import view_synthesis.models as network_arch
 from view_synthesis.utils import prepare_device, is_main_process, prepare_logging, mse2psnr, get_minibatches
-from view_synthesis.nerf import RaySampler, PointSampler, get_embedding_function, volume_render_radiance_field
+from view_synthesis.nerf import RaySampler, PointSampler, get_embedding_function, volume_render_radiance_field, PositionalEmbedder
 
 
 def prepare_dataloader(rank: int, cfg: CfgNode) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
@@ -61,9 +60,9 @@ def prepare_dataloader(rank: int, cfg: CfgNode) -> Tuple[torch.utils.data.DataLo
             num_samples=cfg.experiment.train_iters
         )
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=cfg.dataset.train_batch_size, shuffle=False, num_workers=multiprocessing.cpu_count(), sampler=train_sampler)
+        train_dataset, batch_size=cfg.dataset.train_batch_size, shuffle=False, num_workers=0, sampler=train_sampler)
     val_dataloader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=cfg.dataset.val_batch_size, shuffle=False, num_workers=multiprocessing.cpu_count(), sampler=val_sampler)
+        val_dataset, batch_size=cfg.dataset.val_batch_size, shuffle=False, num_workers=0, sampler=val_sampler)
     return train_dataloader, val_dataloader
 
 
@@ -200,6 +199,7 @@ def train(rank: int, cfg: CfgNode) -> None:
     first_data_sample = next(iter(train_dataloader))
     (height, width), intrinsic, datatype = first_data_sample["color"][0].shape[
         :2], first_data_sample["intrinsic"][0], first_data_sample["intrinsic"][0].dtype
+
     ray_sampler = RaySampler(height,
                              width,
                              intrinsic,
@@ -215,7 +215,19 @@ def train(rank: int, cfg: CfgNode) -> None:
                                  device=device)
 
     # Prepare Positional Embedding functions
-    embedxyz_fn, embeddirs_fn = prepare_embedding_fns(cfg.models.coarse)
+    embedder_xyz = PositionalEmbedder(num_freq=cfg.models.coarse.num_encoding_fn_xyz,
+                       log_sampling=cfg.models.coarse.log_sampling_xyz,
+                       include_input=cfg.models.coarse.include_input_xyz,
+                       dtype=datatype,
+                       device=device)
+
+    embedder_dir = None
+    if cfg.nerf.use_viewdirs:
+        embedder_dir = PositionalEmbedder(num_freq=cfg.models.coarse.num_encoding_fn_dir,
+                           log_sampling=cfg.models.coarse.log_sampling_dir,
+                           include_input=cfg.models.coarse.include_input_dir,
+                           dtype=datatype,
+                           device=device)
 
     for i in track(range(start_iter, cfg.experiment.train_iters), description="Training..."):
 
@@ -244,17 +256,18 @@ def train(rank: int, cfg: CfgNode) -> None:
                 assert weights is not None, "Weights need to be updated by the coarse network"
                 pts, z_vals = point_sampler.sample_pdf(ro, rd, weights[..., 1:-1])
 
+
             pts_flat = pts.reshape(-1, 3)
 
-            embedded = embedxyz_fn(pts_flat)
+            embedded = embedder_xyz.embed(pts_flat)
             if cfg.nerf.use_viewdirs:
                 viewdirs = rd
                 viewdirs = viewdirs / viewdirs.norm(p=2, dim=-1).unsqueeze(-1)
-                if embeddirs_fn is not None:
-                    input_dirs = viewdirs.repeat([1, z_vals.shape[-1], 1])
-                    input_dirs_flat = input_dirs.reshape(-1, input_dirs.shape[-1])
-                    embedded_dirs = embeddirs_fn(input_dirs_flat)
-                    embedded = torch.cat((embedded, embedded_dirs), dim=-1)
+                input_dirs = viewdirs.repeat([1, z_vals.shape[-1], 1])
+                input_dirs_flat = input_dirs.reshape(-1, input_dirs.shape[-1])
+                embedded_dirs = embedder_dir.embed(input_dirs_flat)
+                embedded = torch.cat((embedded, embedded_dirs), dim=-1)
+
 
             radiance_field = model(embedded)
             radiance_field = radiance_field.reshape(
@@ -286,6 +299,7 @@ def train(rank: int, cfg: CfgNode) -> None:
         if i % cfg.experiment.print_every == 0 or i == cfg.experiment.train_iters - 1:
             wandb.log({"train/loss": loss.item(), "train/psnr": psnr})
             print(f"[TRAIN] Iter: {i:>8} Time taken: {time.time() - then:>4.4f} Loss: {loss.item():>4.4f}, PSNR: {psnr:>4.4f}")
+            # tqdm.tqdm.write(f"Ray: {ray_sample_time}, Point: {point_sample_time}, embed: {embedding_time}, model: {model_time}, render: {render_time}, backward: {backward_time}")
 
         if (i % cfg.experiment.validate_every == 0 or i == cfg.experiment.train_iters - 1):
             for model_name, model in models.items():
@@ -317,15 +331,14 @@ def train(rank: int, cfg: CfgNode) -> None:
                             pts, z_vals = point_sampler.sample_pdf(ro, rd, weights[..., 1:-1])
                         pts_flat = pts.reshape(-1, 3)
 
-                        embedded = embedxyz_fn(pts_flat)
+                        embedded = embedder_xyz.embed(pts_flat)
                         if cfg.nerf.use_viewdirs:
                             viewdirs = rd
                             viewdirs = viewdirs / viewdirs.norm(p=2, dim=-1).unsqueeze(-1)
-                            if embeddirs_fn is not None:
-                                input_dirs = viewdirs.repeat([1, z_vals.shape[-1], 1])
-                                input_dirs_flat = input_dirs.reshape(-1, input_dirs.shape[-1])
-                                embedded_dirs = embeddirs_fn(input_dirs_flat)
-                                embedded = torch.cat((embedded, embedded_dirs), dim=-1)
+                            input_dirs = viewdirs.repeat([1, z_vals.shape[-1], 1])
+                            input_dirs_flat = input_dirs.reshape(-1, input_dirs.shape[-1])
+                            embedded_dirs = embedder_dir.embed(input_dirs_flat)
+                            embedded = torch.cat((embedded, embedded_dirs), dim=-1)
 
                         radiance_field = model(embedded)
 
