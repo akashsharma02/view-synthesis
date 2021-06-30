@@ -23,17 +23,17 @@ dataset:
   # Base directory of dataset.
   basedir: /home/fyusion/Documents/datasets/nerf_synthetic/lego
   # Training batch size (number of images to sample per training step)
-  train_batch_size: 2
+  train_batch_size: 1
   # Validation batch size (number of images to sample per validation step
   val_batch_size: 1
   # For the Blender datasets (synthetic), optionally return images
   # at half the original resolution of 800 x 800, to save space.
-  resolution_level: 16
+  resolution_level: 2
   # Stride (include one per "testskip" images in the dataset).
   testskip: 1
-  # Do not use NDC (normalized device coordinates). Usually True for
+  # Use NDC (normalized device coordinates). Usually False for
   # synthetic (Blender) datasets.
-  no_ndc: True
+  ndc: True
   # Near clip plane (clip all depth values closer than this threshold).
   near: 2
   # Far clip plane (clip all depth values farther than this threshold).
@@ -139,7 +139,7 @@ nerf:
   train:
     # Number of random rays to retain from each image.
     # These sampled rays are used for training, and the others are discarded.
-    num_random_rays: 2048  # 32 * 32 * 4
+    num_random_rays: 4096  # 32 * 32 * 4
     # Size of each chunk (rays are batched into "chunks" and passed through
     # the network)
     # Whether or not to perturb the sampled depth values.
@@ -169,5 +169,3 @@ nerf:
     # Standard deviation of noise to be added to the radiance field when
     # performing volume rendering.
     radiance_field_noise_std: 0.
-    # Sample linearly in disparity space, as opposed to in depth space.
-    lindisp: False

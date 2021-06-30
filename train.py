@@ -61,9 +61,9 @@ def prepare_dataloader(rank: int, cfg: CfgNode) -> Tuple[torch.utils.data.DataLo
             num_samples=cfg.experiment.train_iters
         )
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=cfg.dataset.train_batch_size, shuffle=False, num_workers=multiprocessing.cpu_count()//2, sampler=train_sampler)
+        train_dataset, batch_size=cfg.dataset.train_batch_size, shuffle=False, num_workers=multiprocessing.cpu_count(), sampler=train_sampler)
     val_dataloader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=cfg.dataset.val_batch_size, shuffle=False, num_workers=multiprocessing.cpu_count()//2, sampler=val_sampler)
+        val_dataset, batch_size=cfg.dataset.val_batch_size, shuffle=False, num_workers=multiprocessing.cpu_count(), sampler=val_sampler)
     return train_dataloader, val_dataloader
 
 
@@ -228,19 +228,22 @@ def train(rank: int, cfg: CfgNode) -> None:
             if torch.is_tensor(val):
                 train_data[key] = train_data[key].to(device)
 
-        then = time.time()
         ro, rd, select_inds = ray_sampler.sample(
             tform_cam2world=train_data["pose"])
 
         target_pixels = train_data["color"].view(-1, 4)[select_inds, :]
         weights, viewdirs, pts, z_vals = None, None, None, None
         coarse_loss, fine_loss = None, None
+
+        then = time.time()
         for model_name, model in models.items():
 
-            if weights == None:
+            if model_name == "coarse":
                 pts, z_vals = point_sampler.sample_uniform(ro, rd)
             else:
+                assert weights is not None, "Weights need to be updated by the coarse network"
                 pts, z_vals = point_sampler.sample_pdf(ro, rd, weights[..., 1:-1])
+
             pts_flat = pts.reshape(-1, 3)
 
             embedded = embedxyz_fn(pts_flat)
@@ -275,6 +278,8 @@ def train(rank: int, cfg: CfgNode) -> None:
         loss.backward()
         optimizer.step()
         scheduler.step()
+
+
         optimizer.zero_grad()
 
         psnr = mse2psnr(loss.item())
@@ -348,12 +353,14 @@ def train(rank: int, cfg: CfgNode) -> None:
                 loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
                 psnr = mse2psnr(loss.item())
 
+                rgb_coarse = rgb_coarse.reshape(list(val_data["color"].shape[:-1]) + [rgb_coarse.shape[-1]])
                 rgb_fine = rgb_fine.reshape(list(val_data["color"].shape[:-1]) + [rgb_fine.shape[-1]])
                 target_rgb = target_pixels.reshape(list(val_data["color"].shape[:-1]) + [4])
 
                 wandb.log({"validation/loss": loss.item(),
                            "validation/psnr": psnr,
-                           "validation/rgb": [wandb.Image(rgb_fine[i, ...].permute(2, 0, 1)) for i in range(rgb_fine.shape[0])],
+                           "validation/rgb_coarse": [wandb.Image(rgb_coarse[i, ...].permute(2, 0, 1)) for i in range(rgb_coarse.shape[0])],
+                           "validation/rgb_fine": [wandb.Image(rgb_fine[i, ...].permute(2, 0, 1)) for i in range(rgb_fine.shape[0])],
                            "validation/target": [wandb.Image(target_rgb[i, ..., :3].permute(2, 0, 1)) for i in range(val_data["color"].shape[0])]
                            })
                 print(f"[bold magenta][VAL  ][/bold magenta] Iter: {i:>8} Time taken: {time.time() - val_then:>4.4f} Loss: {loss.item():>4.4f}, PSNR: {psnr:>4.4f}")
