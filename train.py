@@ -18,7 +18,7 @@ from view_synthesis.cfgnode import CfgNode
 import view_synthesis.datasets as datasets
 import view_synthesis.models as network_arch
 from view_synthesis.utils import prepare_device, is_main_process, prepare_logging, mse2psnr, get_minibatches
-from view_synthesis.nerf import RaySampler, PointSampler, get_embedding_function, volume_render_radiance_field, PositionalEmbedder
+from view_synthesis.nerf import RaySampler, PointSampler, volume_render_radiance_field, PositionalEmbedder
 
 
 def prepare_dataloader(rank: int, cfg: CfgNode) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
@@ -178,8 +178,9 @@ def train(rank: int, cfg: CfgNode) -> None:
 
     """
     device = None
+    logdir_path = None
     if is_main_process(rank) or cfg.setup_ddp == False:
-        prepare_logging(cfg)
+        logdir_path = prepare_logging(cfg)
         device = f"cuda:0"
     if cfg.setup_ddp == True:
         device = f"cuda:{rank}"
@@ -299,8 +300,20 @@ def train(rank: int, cfg: CfgNode) -> None:
         if i % cfg.experiment.print_every == 0 or i == cfg.experiment.train_iters - 1:
             wandb.log({"train/loss": loss.item(), "train/psnr": psnr})
             print(f"[TRAIN] Iter: {i:>8} Time taken: {time.time() - then:>4.4f} Loss: {loss.item():>4.4f}, PSNR: {psnr:>4.4f}")
-            # tqdm.tqdm.write(f"Ray: {ray_sample_time}, Point: {point_sample_time}, embed: {embedding_time}, model: {model_time}, render: {render_time}, backward: {backward_time}")
 
+        if i % cfg.experiment.save_every == 0 or i == cfg.experiment.train_iters - 1:
+
+            checkpoint_dict = {
+                "iter": i,
+                "model_coarse_state_dict": models["coarse"].state_dict(),
+                "model_fine_state_dict": models["fine"].state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "loss": loss,
+                "psnr": psnr
+            }
+            torch.save(checkpoint_dict, logdir_path / f"checkpoint{i:5d}.ckpt")
+            print("================== Saved Checkpoint =================")
         if (i % cfg.experiment.validate_every == 0 or i == cfg.experiment.train_iters - 1):
             for model_name, model in models.items():
                 models[model_name].to(device)

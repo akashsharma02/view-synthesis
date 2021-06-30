@@ -52,6 +52,7 @@ def prepare_logging(cfg: CfgNode):
     logdir_path.mkdir(parents=True, exist_ok=True)
     with open(Path(logdir_path) / "config.yml", "w") as f:
         f.write(cfg.dump())
+    return logdir_path
 
 
 def mse2psnr(mse_val: float) -> float:
