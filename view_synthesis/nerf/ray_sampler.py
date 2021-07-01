@@ -57,8 +57,8 @@ class RaySampler(object):
         :function:
             tform_cam2world: [batch, 4, 4] torch.Tensor camera pose (SE3)
         :returns:
-            ray origins: torch.Tensor [3, batch_size*sample_size]
-            ray directions: torch.Tensor [3, batch_size*sample_size]
+            ray origins: torch.Tensor [batch_size*sample_size, 3]
+            ray directions: torch.Tensor [batch_size*sample_size, 3]
             select_inds: np.ndarray [batch_size*sample_size]
 
         """
@@ -85,8 +85,8 @@ class RaySampler(object):
         :function:
             tform_cam2world: 4x4 torch.Tensor camera pose (SE3)
         :returns:
-            ray origins: torch.Tensor [batch, 3, H, W]
-            ray directions: torch.Tensor [batch, 3, H, W]
+            ray origins: torch.Tensor [batch, H, W, 3]
+            ray directions: torch.Tensor [batch, H, W, 3]
 
         """
         ray_directions = torch.tensordot(
@@ -133,6 +133,7 @@ if __name__ == "__main__":
     ray_sampler = RaySampler(
         height, width, intrinsic[0], sample_size=args.num_random_rays, device=device)
     pose = first_data_sample["pose"].to(device)
+    ro, rd = ray_sampler.get_bundle(pose)
     ray_origins, ray_directions, select_inds = ray_sampler.sample(
         tform_cam2world=pose)
 

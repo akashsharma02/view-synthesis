@@ -341,13 +341,13 @@ def train(rank: int, cfg: CfgNode) -> None:
                                                            device)
             if is_main_process(rank) and rgb_coarse is not None and rgb_fine is not None:
                 target_pixels = val_data["color"].view(-1, 4).cpu()
+
                 coarse_loss = torch.nn.functional.mse_loss(
                     rgb_coarse[..., :3], target_pixels[..., :3])
                 fine_loss = torch.nn.functional.mse_loss(
                     rgb_fine[..., :3], target_pixels[..., :3])
-                loss = 0.0
-                loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
-                psnr = mse2psnr(loss.item())
+                loss = coarse_loss + fine_loss
+                psnr = mse2psnr(loss)
 
                 rgb_coarse = rgb_coarse.reshape(
                     list(val_data["color"].shape[:-1]) + [rgb_coarse.shape[-1]])
@@ -355,7 +355,6 @@ def train(rank: int, cfg: CfgNode) -> None:
                     list(val_data["color"].shape[:-1]) + [rgb_fine.shape[-1]])
                 target_rgb = target_pixels.reshape(
                     list(val_data["color"].shape[:-1]) + [4])
-
                 wandb.log({"validation/loss": loss.item(),
                            "validation/psnr": psnr,
                            "validation/rgb_coarse": [wandb.Image(rgb_coarse[i, ...].permute(2, 0, 1)) for i in range(rgb_coarse.shape[0])],
@@ -386,30 +385,29 @@ def validation_render_image(rank: int,
             tform_cam2world=pose)
         ro, rd = ray_origins.reshape(-1, 3), ray_directions.reshape(-1, 3)
         num_rays = ro.shape[0]
-        # msg = f"Number of pixels {ro.shape[0]} in image is not divisible by number of GPUs {cfg.gpus}"
-        # assert (num_rays // cfg.gpus) * cfg.gpus == num_rays, msg
 
-        batch_per_process = [num_rays // cfg.gpus, ] * cfg.gpus
-        padding = num_rays - sum(batch_per_process)
-        batch_per_process[-1] = num_rays - sum(batch_per_process[:-1])
+        batch_per_process = torch.full([cfg.gpus], (num_rays / cfg.gpus), dtype=int)
+        padding = num_rays - torch.sum(batch_per_process)
+        batch_per_process[-1] = num_rays - torch.sum(batch_per_process[:-1])
+        print(batch_per_process, padding)
 
-        padded_batch_per_process = batch_per_process[0] + padding
+        padding_per_process = torch.zeros([cfg.gpus], dtype=int)
+        if padding > 0:
+            padding_per_process[:-1] = padding
+        else:
+            padding_per_process[-1]  = padding
 
+        print(padding_per_process)
         # Only use the split of the rays for the current process
-        ro = torch.split(ro, batch_per_process)[rank].to(device)
-        rd = torch.split(rd, batch_per_process)[rank].to(device)
-
-        padded_ro = torch.empty((padded_batch_per_process, ro.shape[-1]), dtype=ro.dtype, device=ro.device)
-        padded_rd = torch.empty((padded_batch_per_process, rd.shape[-1]), dtype=rd.dtype, device=rd.device)
-        padded_ro[:ro.shape[0], ...] = ro
-        padded_rd[:rd.shape[0], ...] = rd
+        ro_batch = torch.split(ro, batch_per_process.tolist())[rank].to(device)
+        rd_batch = torch.split(rd, batch_per_process.tolist())[rank].to(device)
 
         # Batch the rays allocated to current process
-        ro_batches = get_minibatches(padded_ro, cfg.nerf.validation.chunksize)
-        rd_batches = get_minibatches(padded_rd, cfg.nerf.validation.chunksize)
+        ro_minibatches = get_minibatches(ro_batch, cfg.nerf.validation.chunksize)
+        rd_minibatches = get_minibatches(rd_batch, cfg.nerf.validation.chunksize)
 
         rgb_coarse_batches, rgb_fine_batches = [], []
-        for ro, rd in zip(ro_batches, rd_batches):
+        for ro, rd in zip(ro_minibatches, rd_minibatches):
             weights, viewdirs, pts, z_vals = None, None, None, None
             for model_name, model in models.items():
                 if model_name == "coarse":
@@ -424,11 +422,9 @@ def validation_render_image(rank: int,
                 embedded = embedder_xyz.embed(pts_flat)
                 if cfg.nerf.use_viewdirs:
                     viewdirs = rd
-                    viewdirs = viewdirs / \
-                        viewdirs.norm(p=2, dim=-1).unsqueeze(-1)
+                    viewdirs = viewdirs / viewdirs.norm(p=2, dim=-1).unsqueeze(-1)
                     input_dirs = viewdirs.repeat([1, z_vals.shape[-1], 1])
-                    input_dirs_flat = input_dirs.reshape(
-                        -1, input_dirs.shape[-1])
+                    input_dirs_flat = input_dirs.reshape(-1, input_dirs.shape[-1])
                     embedded_dirs = embedder_dir.embed(input_dirs_flat)
                     embedded = torch.cat((embedded, embedded_dirs), dim=-1)
 
@@ -440,26 +436,28 @@ def validation_render_image(rank: int,
                     radiance_field,
                     z_vals,
                     rd,
-                    white_background=getattr(cfg.nerf, "train").white_background)
+                    white_background=getattr(cfg.nerf, "validation").white_background)
 
                 if model_name == "coarse":
                     rgb_coarse_batches.append(rgb.cpu())
                 else:
                     rgb_fine_batches.append(rgb.cpu())
-            torch.cuda.empty_cache()
 
         rgb_coarse_batches = torch.cat(rgb_coarse_batches, dim=0)
         rgb_fine_batches = torch.cat(rgb_fine_batches, dim=0)
 
+        padded_rgb_coarse = torch.zeros((padding_per_process[rank], rgb_coarse_batches.shape[-1]), dtype=rgb_coarse_batches.dtype, device=rgb_coarse_batches.device)
+        padded_rgb_fine = torch.zeros((padding_per_process[rank], rgb_fine_batches.shape[-1]), dtype=rgb_fine_batches.dtype, device=rgb_fine_batches.device)
+        rgb_coarse_batches = torch.cat([rgb_coarse_batches, padded_rgb_coarse], dim=0)
+        rgb_fine_batches = torch.cat([rgb_fine_batches, padded_rgb_fine], dim=0)
+
         if is_main_process(rank):
-            all_rgb_coarse_batches = [torch.zeros(padded_ro.shape,
-                                       dtype=padded_ro.dtype)] * len(batch_per_process)
-            all_rgb_fine_batches = [torch.zeros(padded_ro.shape,
-                                       dtype=padded_rd.dtype)] * len(batch_per_process)
-            torch.distributed.gather(
-                rgb_coarse_batches, all_rgb_coarse_batches)
-            torch.distributed.gather(
-                rgb_fine_batches, all_rgb_fine_batches)
+            all_rgb_coarse_batches = [torch.ones_like(rgb_coarse_batches) for _ in range(cfg.gpus)]
+            all_rgb_fine_batches = [torch.ones_like(rgb_fine_batches) for _ in range(cfg.gpus)]
+
+            torch.distributed.gather(rgb_coarse_batches, all_rgb_coarse_batches)
+            torch.distributed.gather(rgb_fine_batches, all_rgb_fine_batches)
+
             for i, size in enumerate(batch_per_process):
                 all_rgb_coarse_batches[i] = all_rgb_coarse_batches[i][:size, ...]
                 all_rgb_fine_batches[i] = all_rgb_fine_batches[i][:size, ...]
@@ -467,10 +465,10 @@ def validation_render_image(rank: int,
             all_rgb_coarse_batches = torch.cat(all_rgb_coarse_batches, dim=0)
             all_rgb_fine_batches = torch.cat(all_rgb_fine_batches, dim=0)
             return all_rgb_coarse_batches, all_rgb_fine_batches
-
-        torch.distributed.gather(rgb_coarse_batches)
-        torch.distributed.gather(rgb_fine_batches)
-        return None, None
+        else:
+            torch.distributed.gather(rgb_coarse_batches)
+            torch.distributed.gather(rgb_fine_batches)
+            return None, None
 
 
 def init_process(rank: int, fn: FunctionType, cfg: CfgNode, backend: str = "gloo"):

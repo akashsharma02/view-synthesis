@@ -10,7 +10,7 @@ experiment:
   train_iters: 100000
   convergence_lr: 1e-7
   # Number of training iterations after which to validate.
-  validate_every: 500
+  validate_every: 100
   # Number of training iterations after which to checkpoint.
   save_every: 5000
   # Number of training iterations after which to print progress.
