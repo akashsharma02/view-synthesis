@@ -139,7 +139,7 @@ nerf:
   train:
     # Number of random rays to retain from each image.
     # These sampled rays are used for training, and the others are discarded.
-    num_random_rays: 2048  # 32 * 32 * 8
+    num_random_rays: 8192  # 32 * 32 * 8
     # Size of each chunk (rays are batched into "chunks" and passed through
     # the network)
     # Whether or not to perturb the sampled depth values.

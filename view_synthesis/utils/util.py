@@ -27,10 +27,10 @@ def prepare_device(n_gpus_to_use: int, setup_ddp: bool) -> Tuple[torch.device, L
         print(f"Warning: Setting up DataDistributedParallel is forbidden with 1 GPU.")
         setup_ddp = False
 
-    device = torch.device('cuda:0' if n_gpus_to_use > 0 else 'cpu')
+    main_device = torch.device('cuda:0' if n_gpus_to_use > 0 else 'cpu')
     list_ids = list(range(n_gpus_to_use))
 
-    return device, list_ids
+    return main_device, list_ids
 
 
 def is_main_process(rank: int) -> bool:

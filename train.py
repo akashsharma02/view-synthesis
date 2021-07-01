@@ -1,4 +1,6 @@
 from typing import Dict, List, Tuple
+from types import FunctionType
+import os
 import time
 import argparse
 import wandb
@@ -10,8 +12,8 @@ from collections import OrderedDict
 
 import numpy as np
 import torch
-import torch.distributed
-import torch.multiprocessing
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as ddp
 
 from view_synthesis.cfgnode import CfgNode
@@ -60,9 +62,9 @@ def prepare_dataloader(rank: int, cfg: CfgNode) -> Tuple[torch.utils.data.DataLo
             num_samples=cfg.experiment.train_iters
         )
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=cfg.dataset.train_batch_size, shuffle=False, num_workers=0, sampler=train_sampler)
+        train_dataset, batch_size=cfg.dataset.train_batch_size, shuffle=False, num_workers=0, sampler=train_sampler, pin_memory=True)
     val_dataloader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=cfg.dataset.val_batch_size, shuffle=False, num_workers=0, sampler=val_sampler)
+        val_dataset, batch_size=cfg.dataset.val_batch_size, shuffle=False, num_workers=0, sampler=val_sampler, pin_memory=True)
     return train_dataloader, val_dataloader
 
 
@@ -82,6 +84,7 @@ def prepare_models(rank: int, cfg: CfgNode) -> OrderedDict:
         include_input_dir=cfg.models.coarse.include_input_dir,
         use_viewdirs=cfg.models.coarse.use_viewdirs,
     )
+    models["coarse"].to(rank)
     if hasattr(cfg.models, "fine"):
         models['fine'] = getattr(network_arch, cfg.models.fine.type)(
             num_encoding_fn_xyz=cfg.models.fine.num_encoding_fn_xyz,
@@ -90,35 +93,37 @@ def prepare_models(rank: int, cfg: CfgNode) -> OrderedDict:
             include_input_dir=cfg.models.fine.include_input_dir,
             use_viewdirs=cfg.models.fine.use_viewdirs,
         )
+        models["fine"].to(rank)
+
     if cfg.setup_ddp == True:
-        torch.cuda.set_device(rank)
-        ddp(models['coarse'], device_ids=[rank],
-            output_device=rank, find_unused_parameters=True)
+        models["coarse"] = ddp(models['coarse'], device_ids=[rank],
+                               output_device=rank)
+        if hasattr(cfg.models, "fine"):
+            models["fine"] = ddp(models['coarse'], device_ids=[rank],
+                                 output_device=rank)
 
     return models
 
 
-def prepare_optimizer(rank: int, cfg: CfgNode, models: "OrderedDict[str, torch.nn.Module]") -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
+def prepare_optimizer(rank: int, cfg: CfgNode, models: "OrderedDict[str, torch.nn.Module]") -> Tuple[OrderedDict, OrderedDict]:
     """ Load the optimizer and learning schedule according to the configuration
 
     :function: TODO
     :returns: TODO
 
     """
-    trainable_params = []
+    optimizers, schedulers = OrderedDict(), OrderedDict()
     for model_name, model in models.items():
-        trainable_params += models[model_name].parameters()
-    optimizer = getattr(torch.optim, cfg.optimizer.type)(
-        trainable_params, lr=cfg.optimizer.lr)
-    # TODO: Define custom scheduler which handles this from config
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 0.1 ** (epoch / cfg.experiment.train_iters))
+        optimizers[model_name] = getattr(torch.optim, cfg.optimizer.type)(
+            model.parameters(), lr=cfg.optimizer.lr)
+        # TODO: Define custom scheduler which handles this from config
+        schedulers[model_name] = torch.optim.lr_scheduler.LambdaLR(
+            optimizers[model_name], lr_lambda=lambda epoch: 0.1 ** (epoch / cfg.experiment.train_iters))
 
-    # scheduler = getattr(torch.optim.lr_scheduler, cfg.optimizer.scheduler_type)(
-    #     optimizer=optimizer, **cfg.optimizer.scheduler_args)
-    return optimizer, scheduler
+    return optimizers, schedulers
 
 
-def load_checkpoint(rank: int, cfg: CfgNode, models: "OrderedDict[str, torch.nn.Module]", optimizer: torch.optim.Optimizer) -> int:
+def load_checkpoint(rank: int, cfg: CfgNode, models: "OrderedDict[str, torch.nn.Module]", optimizers: "OrderedDict[str, torch.optim.Optimizer]") -> int:
     """TODO: Docstring for load_pretrained.
 
     :function: TODO
@@ -130,17 +135,21 @@ def load_checkpoint(rank: int, cfg: CfgNode, models: "OrderedDict[str, torch.nn.
     checkpoint_file = Path(cfg.load_checkpoint)
     if checkpoint_file.exists() and checkpoint_file.is_file() and checkpoint_file.suffix == ".ckpt":
         if cfg.setup_ddp == True:
-            # map_location = {"cuda:0": f"cuda:{rank}"}
-            # checkpoint = torch.load(cfg.load_checkpoint, map_location=map_location)
-            # TODO
-            pass
+            map_location = {"cuda:0": f"cuda:{rank}"}
+            checkpoint = torch.load(
+                cfg.load_checkpoint, map_location=map_location)
         else:
             checkpoint = torch.load(cfg.load_checkpoint)
-            for model_name, model in models.items():
-                model.load_state_dict(
-                    checkpoint[f"model_{model_name}_state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            start_iter = checkpoint["start_iter"]
+
+        for model_name, model in models.items():
+            model.load_state_dict(
+                checkpoint[f"model_{model_name}_state_dict"])
+            optimizers[model_name].load_state_dict(
+                checkpoint["optimizer_{model_name}_state_dict"])
+        start_iter = checkpoint["start_iter"]
+
+    # Ensure that all loading by all processes is done before any process has started saving models
+    torch.distributed.barrier()
     return start_iter
 
 
@@ -177,24 +186,31 @@ def train(rank: int, cfg: CfgNode) -> None:
     :returns: TODO
 
     """
-    device = None
-    logdir_path = None
+    # Seed experiment for repeatability (Each process should sample different rays)
+    seed = cfg.experiment.randomseed + rank
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    # Set device and logdir_path
+    device, logdir_path = None, None
     if is_main_process(rank) or cfg.setup_ddp == False:
         logdir_path = prepare_logging(cfg)
         device = f"cuda:0"
     if cfg.setup_ddp == True:
         device = f"cuda:{rank}"
         torch.distributed.barrier()
+        torch.cuda.set_device(rank)
 
     # Load Data
     train_dataloader, val_dataloader = prepare_dataloader(rank, cfg)
 
     # Prepare Model, Optimizer, and load checkpoint
     models = prepare_models(rank, cfg)
-    for _, model in models.items():
-        wandb.watch(model)
-    optimizer, scheduler = prepare_optimizer(rank, cfg, models)
-    start_iter = load_checkpoint(rank, cfg, models, optimizer)
+    if is_main_process(rank):
+        for _, model in models.items():
+            wandb.watch(model)
+    optimizers, schedulers = prepare_optimizer(rank, cfg, models)
+    start_iter = load_checkpoint(rank, cfg, models, optimizers)
 
     # Prepare RaySampler
     first_data_sample = next(iter(train_dataloader))
@@ -217,29 +233,28 @@ def train(rank: int, cfg: CfgNode) -> None:
 
     # Prepare Positional Embedding functions
     embedder_xyz = PositionalEmbedder(num_freq=cfg.models.coarse.num_encoding_fn_xyz,
-                       log_sampling=cfg.models.coarse.log_sampling_xyz,
-                       include_input=cfg.models.coarse.include_input_xyz,
-                       dtype=datatype,
-                       device=device)
+                                      log_sampling=cfg.models.coarse.log_sampling_xyz,
+                                      include_input=cfg.models.coarse.include_input_xyz,
+                                      dtype=datatype,
+                                      device=device)
 
     embedder_dir = None
     if cfg.nerf.use_viewdirs:
         embedder_dir = PositionalEmbedder(num_freq=cfg.models.coarse.num_encoding_fn_dir,
-                           log_sampling=cfg.models.coarse.log_sampling_dir,
-                           include_input=cfg.models.coarse.include_input_dir,
-                           dtype=datatype,
-                           device=device)
+                                          log_sampling=cfg.models.coarse.log_sampling_dir,
+                                          include_input=cfg.models.coarse.include_input_dir,
+                                          dtype=datatype,
+                                          device=device)
 
-    for i in track(range(start_iter, cfg.experiment.train_iters), description="Training..."):
+    for i in range(start_iter, cfg.experiment.train_iters):
 
         for model_name, model in models.items():
-            models[model_name].to(device)
             models[model_name].train()
 
         train_data = next(iter(train_dataloader))
         for key, val in train_data.items():
             if torch.is_tensor(val):
-                train_data[key] = train_data[key].to(device)
+                train_data[key] = train_data[key].to(device, non_blocking=True)
 
         ro, rd, select_inds = ray_sampler.sample(
             tform_cam2world=train_data["pose"])
@@ -249,14 +264,15 @@ def train(rank: int, cfg: CfgNode) -> None:
         coarse_loss, fine_loss = None, None
 
         then = time.time()
+        logs = str()
         for model_name, model in models.items():
-
+            optimizer, scheduler = optimizers[model_name], schedulers[model_name]
             if model_name == "coarse":
                 pts, z_vals = point_sampler.sample_uniform(ro, rd)
             else:
                 assert weights is not None, "Weights need to be updated by the coarse network"
-                pts, z_vals = point_sampler.sample_pdf(ro, rd, weights[..., 1:-1])
-
+                pts, z_vals = point_sampler.sample_pdf(
+                    ro, rd, weights[..., 1:-1])
 
             pts_flat = pts.reshape(-1, 3)
 
@@ -269,10 +285,9 @@ def train(rank: int, cfg: CfgNode) -> None:
                 embedded_dirs = embedder_dir.embed(input_dirs_flat)
                 embedded = torch.cat((embedded, embedded_dirs), dim=-1)
 
-
             radiance_field = model(embedded)
             radiance_field = radiance_field.reshape(
-                    list(z_vals.shape) + [radiance_field.shape[-1]])
+                list(z_vals.shape) + [radiance_field.shape[-1]])
 
             (rgb, _, _, weights, _) = volume_render_radiance_field(
                 radiance_field,
@@ -280,108 +295,66 @@ def train(rank: int, cfg: CfgNode) -> None:
                 rd,
                 white_background=getattr(cfg.nerf, "train").white_background)
 
-            if model_name == "coarse":
-                coarse_loss = torch.nn.functional.mse_loss(
-                                rgb[..., :3], target_pixels[..., :3])
-            else:
-                fine_loss = torch.nn.functional.mse_loss(
-                                rgb[..., :3], target_pixels[..., :3])
+            loss = torch.nn.functional.mse_loss(
+                rgb[..., :3], target_pixels[..., :3])
 
-        loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            psnr = mse2psnr(loss.item())
+            if is_main_process(rank):
+                wandb.log({f"train/{model_name}_loss": loss.item(),
+                          f"train/{model_name}_psnr": psnr})
+            logs += f"{model_name} Loss: {loss.item():>4.4f}, {model_name} PSNR: {psnr:>4.4f} "
 
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
+        if is_main_process(rank) and i % cfg.experiment.print_every == 0 or i == cfg.experiment.train_iters - 1:
+            print(
+                f"[TRAIN] Iter: {i:>8} Time taken: {time.time() - then:>4.4f} {logs} ")
 
-
-        optimizer.zero_grad()
-
-        psnr = mse2psnr(loss.item())
-        if i % cfg.experiment.print_every == 0 or i == cfg.experiment.train_iters - 1:
-            wandb.log({"train/loss": loss.item(), "train/psnr": psnr})
-            print(f"[TRAIN] Iter: {i:>8} Time taken: {time.time() - then:>4.4f} Loss: {loss.item():>4.4f}, PSNR: {psnr:>4.4f}")
-
-        if i % cfg.experiment.save_every == 0 or i == cfg.experiment.train_iters - 1:
-
+        if is_main_process(rank) and i % cfg.experiment.save_every == 0 or i == cfg.experiment.train_iters - 1:
             checkpoint_dict = {
                 "iter": i,
                 "model_coarse_state_dict": models["coarse"].state_dict(),
                 "model_fine_state_dict": models["fine"].state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "loss": loss,
-                "psnr": psnr
+                "optimizer_coarse_state_dict": optimizers["coarse"].state_dict(),
+                "optimizer_fine_state_dict": optimizers["fine"].state_dict(),
             }
             torch.save(checkpoint_dict, logdir_path / f"checkpoint{i:5d}.ckpt")
             print("================== Saved Checkpoint =================")
+
+        # TODO: Parallel validation and rendering of images
         if (i % cfg.experiment.validate_every == 0 or i == cfg.experiment.train_iters - 1):
-            for model_name, model in models.items():
-                models[model_name].to(device)
-                models[model_name].eval()
-            with torch.no_grad():
-                val_data = next(iter(val_dataloader))
-                for key, val in val_data.items():
-                    if torch.is_tensor(val):
-                        val_data[key] = val_data[key].to(device)
+            val_data = next(iter(val_dataloader))
+            for key, val in val_data.items():
+                if torch.is_tensor(val):
+                    val_data[key] = val_data[key].to(device)
 
-                ray_origins, ray_directions = ray_sampler.get_bundle(tform_cam2world=val_data["pose"])
-                ro, rd = ray_origins.reshape(-1, 3), ray_directions.reshape(-1, 3)
-                target_pixels = val_data["color"].view(-1, 4)
-
-                ro_batches = get_minibatches(ro, cfg.nerf.validation.chunksize)
-                rd_batches = get_minibatches(rd, cfg.nerf.validation.chunksize)
-
-                rgb_coarse, rgb_fine = [], []
-                coarse_loss, fine_loss = None, None
-                val_then = time.time()
-                # TODO: Clean this shit up
-                for ro, rd in zip(ro_batches, rd_batches):
-                    weights, viewdirs, pts, z_vals = None, None, None, None
-                    for model_name, model in models.items():
-                        if model_name == "coarse":
-                            pts, z_vals = point_sampler.sample_uniform(ro, rd)
-                        else:
-                            pts, z_vals = point_sampler.sample_pdf(ro, rd, weights[..., 1:-1])
-                        pts_flat = pts.reshape(-1, 3)
-
-                        embedded = embedder_xyz.embed(pts_flat)
-                        if cfg.nerf.use_viewdirs:
-                            viewdirs = rd
-                            viewdirs = viewdirs / viewdirs.norm(p=2, dim=-1).unsqueeze(-1)
-                            input_dirs = viewdirs.repeat([1, z_vals.shape[-1], 1])
-                            input_dirs_flat = input_dirs.reshape(-1, input_dirs.shape[-1])
-                            embedded_dirs = embedder_dir.embed(input_dirs_flat)
-                            embedded = torch.cat((embedded, embedded_dirs), dim=-1)
-
-                        radiance_field = model(embedded)
-
-                        radiance_field = radiance_field.reshape(
-                                list(z_vals.shape) + [radiance_field.shape[-1]])
-
-                        (rgb, _, _, weights, _) = volume_render_radiance_field(
-                            radiance_field,
-                            z_vals,
-                            rd,
-                            white_background=getattr(cfg.nerf, "train").white_background)
-                        if model_name == "coarse":
-                            rgb_coarse.append(rgb)
-                        else:
-                            rgb_fine.append(rgb)
-
-                rgb_coarse = torch.cat(rgb_coarse, dim=0)
-                rgb_fine = torch.cat(rgb_fine, dim=0)
-
+            val_then = time.time()
+            rgb_coarse, rgb_fine = validation_render_image(rank,
+                                                           val_data["pose"],
+                                                           cfg,
+                                                           models,
+                                                           ray_sampler,
+                                                           point_sampler,
+                                                           [embedder_xyz, embedder_dir],
+                                                           device)
+            if is_main_process(rank) and rgb_coarse is not None and rgb_fine is not None:
+                target_pixels = val_data["color"].view(-1, 4).cpu()
                 coarse_loss = torch.nn.functional.mse_loss(
-                                rgb_coarse[..., :3], target_pixels[..., :3])
+                    rgb_coarse[..., :3], target_pixels[..., :3])
                 fine_loss = torch.nn.functional.mse_loss(
-                                rgb_fine[..., :3], target_pixels[..., :3])
+                    rgb_fine[..., :3], target_pixels[..., :3])
                 loss = 0.0
                 loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
                 psnr = mse2psnr(loss.item())
 
-                rgb_coarse = rgb_coarse.reshape(list(val_data["color"].shape[:-1]) + [rgb_coarse.shape[-1]])
-                rgb_fine = rgb_fine.reshape(list(val_data["color"].shape[:-1]) + [rgb_fine.shape[-1]])
-                target_rgb = target_pixels.reshape(list(val_data["color"].shape[:-1]) + [4])
+                rgb_coarse = rgb_coarse.reshape(
+                    list(val_data["color"].shape[:-1]) + [rgb_coarse.shape[-1]])
+                rgb_fine = rgb_fine.reshape(
+                    list(val_data["color"].shape[:-1]) + [rgb_fine.shape[-1]])
+                target_rgb = target_pixels.reshape(
+                    list(val_data["color"].shape[:-1]) + [4])
 
                 wandb.log({"validation/loss": loss.item(),
                            "validation/psnr": psnr,
@@ -390,6 +363,128 @@ def train(rank: int, cfg: CfgNode) -> None:
                            "validation/target": [wandb.Image(target_rgb[i, ..., :3].permute(2, 0, 1)) for i in range(val_data["color"].shape[0])]
                            })
                 print(f"[bold magenta][VAL  ][/bold magenta] Iter: {i:>8} Time taken: {time.time() - val_then:>4.4f} Loss: {loss.item():>4.4f}, PSNR: {psnr:>4.4f}")
+
+
+def validation_render_image(rank: int,
+                            pose: torch.Tensor,
+                            cfg: CfgNode,
+                            models: "OrderedDict[torch.nn.Module, torch.nn.Module]",
+                            ray_sampler: RaySampler,
+                            point_sampler: PointSampler,
+                            embedders: List[PositionalEmbedder],
+                            device: torch.cuda.Device):
+    """Parallely render images on multiple GPUs for validation
+    """
+    for model_name, model in models.items():
+        models[model_name].to(device)
+        models[model_name].eval()
+
+    embedder_xyz, embedder_dir = embedders[0], embedders[1]
+    with torch.no_grad():
+
+        ray_origins, ray_directions = ray_sampler.get_bundle(
+            tform_cam2world=pose)
+        ro, rd = ray_origins.reshape(-1, 3), ray_directions.reshape(-1, 3)
+        num_rays = ro.shape[0]
+        # msg = f"Number of pixels {ro.shape[0]} in image is not divisible by number of GPUs {cfg.gpus}"
+        # assert (num_rays // cfg.gpus) * cfg.gpus == num_rays, msg
+
+        batch_per_process = [num_rays // cfg.gpus, ] * cfg.gpus
+        padding = num_rays - sum(batch_per_process)
+        batch_per_process[-1] = num_rays - sum(batch_per_process[:-1])
+
+        padded_batch_per_process = batch_per_process[0] + padding
+
+        # Only use the split of the rays for the current process
+        ro = torch.split(ro, batch_per_process)[rank].to(device)
+        rd = torch.split(rd, batch_per_process)[rank].to(device)
+
+        padded_ro = torch.empty((padded_batch_per_process, ro.shape[-1]), dtype=ro.dtype, device=ro.device)
+        padded_rd = torch.empty((padded_batch_per_process, rd.shape[-1]), dtype=rd.dtype, device=rd.device)
+        padded_ro[:ro.shape[0], ...] = ro
+        padded_rd[:rd.shape[0], ...] = rd
+
+        # Batch the rays allocated to current process
+        ro_batches = get_minibatches(padded_ro, cfg.nerf.validation.chunksize)
+        rd_batches = get_minibatches(padded_rd, cfg.nerf.validation.chunksize)
+
+        rgb_coarse_batches, rgb_fine_batches = [], []
+        for ro, rd in zip(ro_batches, rd_batches):
+            weights, viewdirs, pts, z_vals = None, None, None, None
+            for model_name, model in models.items():
+                if model_name == "coarse":
+                    pts, z_vals = point_sampler.sample_uniform(ro, rd)
+                else:
+                    assert weights is not None, "Weights need to be updated by the coarse network"
+                    pts, z_vals = point_sampler.sample_pdf(
+                        ro, rd, weights[..., 1:-1])
+
+                pts_flat = pts.reshape(-1, 3)
+
+                embedded = embedder_xyz.embed(pts_flat)
+                if cfg.nerf.use_viewdirs:
+                    viewdirs = rd
+                    viewdirs = viewdirs / \
+                        viewdirs.norm(p=2, dim=-1).unsqueeze(-1)
+                    input_dirs = viewdirs.repeat([1, z_vals.shape[-1], 1])
+                    input_dirs_flat = input_dirs.reshape(
+                        -1, input_dirs.shape[-1])
+                    embedded_dirs = embedder_dir.embed(input_dirs_flat)
+                    embedded = torch.cat((embedded, embedded_dirs), dim=-1)
+
+                radiance_field = model(embedded)
+                radiance_field = radiance_field.reshape(
+                    list(z_vals.shape) + [radiance_field.shape[-1]])
+
+                (rgb, _, _, weights, _) = volume_render_radiance_field(
+                    radiance_field,
+                    z_vals,
+                    rd,
+                    white_background=getattr(cfg.nerf, "train").white_background)
+
+                if model_name == "coarse":
+                    rgb_coarse_batches.append(rgb.cpu())
+                else:
+                    rgb_fine_batches.append(rgb.cpu())
+            torch.cuda.empty_cache()
+
+        rgb_coarse_batches = torch.cat(rgb_coarse_batches, dim=0)
+        rgb_fine_batches = torch.cat(rgb_fine_batches, dim=0)
+
+        if is_main_process(rank):
+            all_rgb_coarse_batches = [torch.zeros(padded_ro.shape,
+                                       dtype=padded_ro.dtype)] * len(batch_per_process)
+            all_rgb_fine_batches = [torch.zeros(padded_ro.shape,
+                                       dtype=padded_rd.dtype)] * len(batch_per_process)
+            torch.distributed.gather(
+                rgb_coarse_batches, all_rgb_coarse_batches)
+            torch.distributed.gather(
+                rgb_fine_batches, all_rgb_fine_batches)
+            for i, size in enumerate(batch_per_process):
+                all_rgb_coarse_batches[i] = all_rgb_coarse_batches[i][:size, ...]
+                all_rgb_fine_batches[i] = all_rgb_fine_batches[i][:size, ...]
+
+            all_rgb_coarse_batches = torch.cat(all_rgb_coarse_batches, dim=0)
+            all_rgb_fine_batches = torch.cat(all_rgb_fine_batches, dim=0)
+            return all_rgb_coarse_batches, all_rgb_fine_batches
+
+        torch.distributed.gather(rgb_coarse_batches)
+        torch.distributed.gather(rgb_fine_batches)
+        return None, None
+
+
+def init_process(rank: int, fn: FunctionType, cfg: CfgNode, backend: str = "gloo"):
+    """TODO: Docstring for init_process.
+
+    :function: TODO
+    :returns: TODO
+
+    """
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29500"
+    dist.init_process_group(backend, rank=rank,  world_size=cfg.gpus)
+    fn(rank, cfg)
+
 
 def main(cfg: CfgNode):
     """ Main function setting up the training loop
@@ -401,18 +496,14 @@ def main(cfg: CfgNode):
     # # (Optional:) enable this to track autograd issues when debugging
     # torch.autograd.set_detect_anomaly(True)
 
-    # Seed experiment for repeatability
-    seed = cfg.experiment.randomseed
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    device, device_ids = prepare_device(cfg.gpus, cfg.setup_ddp)
+    _, device_ids = prepare_device(cfg.gpus, cfg.setup_ddp)
 
     if len(device_ids) > 1 and configargs.setup_ddp == True:
         # TODO: Setup DataDistributedParallel
-        pass
-
-    train(0, cfg)
+        print(f"Using {len(device_ids)} GPUs for training")
+        mp.spawn(init_process, args=(train, cfg), nprocs=cfg.gpus, join=True)
+    else:
+        train(0, cfg)
 
 
 if __name__ == "__main__":
