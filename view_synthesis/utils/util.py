@@ -1,11 +1,13 @@
 from typing import Tuple, List, Optional
 import math
 import torch
+import numpy as np
 from pathlib import Path
 import yaml
 import wandb
 
 from view_synthesis.cfgnode import CfgNode
+
 
 
 def prepare_device(n_gpus_to_use: int, setup_ddp: bool) -> Tuple[torch.device, List[int]]:
@@ -52,6 +54,7 @@ def prepare_logging(cfg: CfgNode):
     logdir_path.mkdir(parents=True, exist_ok=True)
     with open(Path(logdir_path) / "config.yml", "w") as f:
         f.write(cfg.dump())
+
     return logdir_path
 
 
@@ -88,3 +91,4 @@ def meshgrid_xy(
     # TESTED
     ii, jj = torch.meshgrid(tensor1, tensor2)
     return ii.transpose(-1, -2), jj.transpose(-1, -2)
+
