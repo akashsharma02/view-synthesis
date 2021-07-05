@@ -50,7 +50,7 @@ def prepare_dataloader(cfg: CfgNode) -> Tuple[torch.utils.data.DataLoader, torch
         num_samples=cfg.experiment.load_iters
     )
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=cfg.dataset.train_batch_size, shuffle=False, num_workers=mp.cpu_count()//2, sampler=train_sampler, pin_memory=True)
+        train_dataset, batch_size=cfg.dataset.train_batch_size, shuffle=False, num_workers=0, sampler=train_sampler, pin_memory=True)
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset, batch_size=cfg.dataset.val_batch_size, shuffle=False, num_workers=0, sampler=val_sampler, pin_memory=True)
     return train_dataloader, val_dataloader
@@ -332,10 +332,11 @@ def train(rank: int, cfg: CfgNode) -> None:
             val_data = next(iter(val_dataloader))
 
             # Broadcast validation data in rank 0 to all the processes
-            val_data = list(val_data.items())
             if cfg.setup_ddp == True:
+                val_data = list(val_data.items())
                 torch.distributed.broadcast_object_list(val_data, 0)
-            val_data = dict(val_data)
+                val_data = dict(val_data)
+
             for key, val in val_data.items():
                 if torch.is_tensor(val):
                     val_data[key] = val_data[key].to(device)
@@ -350,7 +351,7 @@ def train(rank: int, cfg: CfgNode) -> None:
                                                          [embedder_xyz, embedder_dir],
                                                          device)
 
-            if is_main_process(rank):
+            if is_main_process(rank) or cfg.setup_ddp == False:
                 assert rgb_coarse is not None, "Main process must contain rgb_coarse"
                 assert rgb_fine is not None, "Main process must contain rgb_fine"
 
