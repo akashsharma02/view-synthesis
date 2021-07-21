@@ -1,16 +1,14 @@
 from typing import Tuple, List, Optional
 import math
 import torch
-import numpy as np
 from pathlib import Path
-import yaml
 import wandb
 
 from view_synthesis.cfgnode import CfgNode
 
 
 
-def prepare_device(n_gpus_to_use: int, setup_ddp: bool) -> Tuple[torch.device, List[int]]:
+def prepare_device(n_gpus_to_use: int, is_distributed: bool) -> Tuple[torch.device, List[int]]:
     """ Prepare GPU device if available, and get GPU indices for DataDistributedParallel
 
     :function: TODO
@@ -25,9 +23,10 @@ def prepare_device(n_gpus_to_use: int, setup_ddp: bool) -> Tuple[torch.device, L
         print(f"Warning: The number of GPU\'s configured to use is {n_gpus_to_use}, but only {n_gpu} are "
               "available on this machine.")
         n_gpus_to_use = n_gpu
-    if n_gpus_to_use < 2 and setup_ddp == True:
-        print(f"Warning: Setting up DataDistributedParallel is forbidden with 1 GPU.")
-        setup_ddp = False
+    # TODO: Remove this, (using only for debugging)
+    # if n_gpus_to_use < 2 and is_distributed == True:
+    #     print(f"Warning: Setting up DataDistributedParallel is forbidden with 1 GPU.")
+    #     is_distributed = False
 
     main_device = torch.device('cuda:0' if n_gpus_to_use > 0 else 'cpu')
     list_ids = list(range(n_gpus_to_use))

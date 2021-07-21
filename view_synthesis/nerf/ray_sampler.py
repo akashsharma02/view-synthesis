@@ -10,7 +10,7 @@ class RaySampler(object):
 
     """RaySampler samples rays for a given image size and intrinsics """
 
-    def __init__(self, height: int, width: int, intrinsics: Union[torch.Tensor, np.ndarray], sample_size: int, device: torch.cuda.Device):
+    def __init__(self, seed, height: int, width: int, intrinsics: Union[torch.Tensor, np.ndarray], sample_size: int, device: torch.cuda.Device):
         """ Prepares a ray bundle for a given image size and intrinsics
 
         :Function: intrinsics: torch.Tensor 4x4
@@ -20,6 +20,7 @@ class RaySampler(object):
         assert sample_size > 0 and sample_size < height * \
             width, "Sample size must be a positive number less than height * width"
 
+        self.rng = np.random.default_rng(seed)
         self.height = height
         self.width = width
         self.sample_size = sample_size
@@ -68,7 +69,7 @@ class RaySampler(object):
         ray_origins, ray_directions = self.get_bundle(tform_cam2world)
         ro, rd = ray_origins.reshape(-1, 3), ray_directions.reshape(-1, 3)
 
-        select_inds = np.random.choice(
+        select_inds = self.rng.choice(
             ro.shape[-2], size=(
                 self.sample_size*batch_size), replace=False
         )
@@ -109,8 +110,9 @@ if __name__ == "__main__":
                         help="Number of random rays to sample", required=True)
 
     args = parser.parse_args()
-    np.random.seed(42)
-    torch.manual_seed(42)
+    seed = 42
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     from view_synthesis.datasets.dataset import BlenderNeRFDataset
     dataset = BlenderNeRFDataset(args.dataset_dir, resolution_level=32, mode="val")
@@ -130,7 +132,7 @@ if __name__ == "__main__":
     else:
         device = "cpu"
 
-    ray_sampler = RaySampler(
+    ray_sampler = RaySampler(seed,
         height, width, intrinsic[0], sample_size=args.num_random_rays, device=device)
     pose = first_data_sample["pose"].to(device)
     ro, rd = ray_sampler.get_bundle(pose)

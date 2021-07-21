@@ -1,11 +1,9 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 from types import FunctionType
 import os
 import time
 import argparse
 import wandb
-from rich.progress import track
-from rich import print
 import yaml
 from pathlib import Path
 from collections import OrderedDict
@@ -15,7 +13,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as ddp
+from apex.parallel import DistributedDataParallel as ddp
 
 from view_synthesis.cfgnode import CfgNode
 import view_synthesis.datasets as datasets
@@ -44,19 +42,23 @@ def prepare_dataloader(cfg: CfgNode) -> Tuple[torch.utils.data.DataLoader, torch
         replacement=True,
         num_samples=cfg.experiment.load_iters
     )
+
     val_sampler = torch.utils.data.RandomSampler(
         val_dataset,
         replacement=True,
         num_samples=cfg.experiment.load_iters
     )
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=cfg.dataset.train_batch_size, shuffle=False, num_workers=0, sampler=train_sampler, pin_memory=True)
+
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset, batch_size=cfg.dataset.val_batch_size, shuffle=False, num_workers=0, sampler=val_sampler, pin_memory=True)
+
     return train_dataloader, val_dataloader
 
 
-def prepare_models(rank: int, cfg: CfgNode) -> OrderedDict:
+def prepare_models(cfg: CfgNode) -> OrderedDict:
     """ Prepare the torch models
 
     :function:
@@ -64,6 +66,7 @@ def prepare_models(rank: int, cfg: CfgNode) -> OrderedDict:
     :returns: TODO
 
     """
+    rank = dist.get_rank()
     models = OrderedDict()
     models['coarse'] = getattr(network_arch, cfg.models.coarse.type)(
         num_encoding_fn_xyz=cfg.models.coarse.num_encoding_fn_xyz,
@@ -73,6 +76,7 @@ def prepare_models(rank: int, cfg: CfgNode) -> OrderedDict:
         use_viewdirs=cfg.models.coarse.use_viewdirs,
     )
     models["coarse"].to(rank)
+
     if hasattr(cfg.models, "fine"):
         models['fine'] = getattr(network_arch, cfg.models.fine.type)(
             num_encoding_fn_xyz=cfg.models.fine.num_encoding_fn_xyz,
@@ -83,35 +87,34 @@ def prepare_models(rank: int, cfg: CfgNode) -> OrderedDict:
         )
         models["fine"].to(rank)
 
-    if cfg.setup_ddp == True:
-        models["coarse"] = ddp(models['coarse'], device_ids=[rank],
-                               output_device=rank)
+    if cfg.is_distributed == True:
+        models["coarse"] = ddp(models['coarse'])
         if hasattr(cfg.models, "fine"):
-            models["fine"] = ddp(models['coarse'], device_ids=[rank],
-                                 output_device=rank)
+            models["fine"] = ddp(models['coarse'])
 
     return models
 
 
-def prepare_optimizer(rank: int, cfg: CfgNode, models: "OrderedDict[str, torch.nn.Module]") -> Tuple[OrderedDict, OrderedDict]:
+def prepare_optimizer(cfg: CfgNode, models: "OrderedDict[str, torch.nn.Module]") -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
     """ Load the optimizer and learning schedule according to the configuration
 
     :function: TODO
     :returns: TODO
 
     """
-    optimizers, schedulers = OrderedDict(), OrderedDict()
+    trainable_params = []
     for model_name, model in models.items():
-        optimizers[model_name] = getattr(torch.optim, cfg.optimizer.type)(
-            model.parameters(), lr=cfg.optimizer.lr)
-        # TODO: Define custom scheduler which handles this from config
-        schedulers[model_name] = torch.optim.lr_scheduler.LambdaLR(
-            optimizers[model_name], lr_lambda=lambda epoch: 0.1 ** (epoch / cfg.experiment.load_iters))
+        trainable_params += list(model.parameters())
+    optimizer = getattr(torch.optim, cfg.optimizer.type)(
+        trainable_params, lr=cfg.optimizer.lr)
 
-    return optimizers, schedulers
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=lambda epoch: cfg.optimizer.scheduler_gamma ** (epoch / cfg.optimizer.scheduler_step_size))
+
+    return optimizer, scheduler
 
 
-def load_checkpoint(rank: int, cfg: CfgNode, models: "OrderedDict[str, torch.nn.Module]", optimizers: "OrderedDict[str, torch.optim.Optimizer]") -> int:
+def load_checkpoint(rank: int, cfg: CfgNode, models: "OrderedDict[str, torch.nn.Module]", optimizer: torch.optim.Optimizer) -> int:
     """TODO: Docstring for load_pretrained.
 
     :function: TODO
@@ -122,7 +125,7 @@ def load_checkpoint(rank: int, cfg: CfgNode, models: "OrderedDict[str, torch.nn.
     print(Path(cfg.load_checkpoint))
     checkpoint_file = Path(cfg.load_checkpoint)
     if checkpoint_file.exists() and checkpoint_file.is_file() and checkpoint_file.suffix == ".ckpt":
-        if cfg.setup_ddp == True:
+        if cfg.is_distributed == True:
             map_location = {"cuda:0": f"cuda:{rank}"}
             checkpoint = torch.load(
                 cfg.load_checkpoint, map_location=map_location)
@@ -132,12 +135,13 @@ def load_checkpoint(rank: int, cfg: CfgNode, models: "OrderedDict[str, torch.nn.
         for model_name, model in models.items():
             model.load_state_dict(
                 checkpoint[f"model_{model_name}_state_dict"])
-            optimizers[model_name].load_state_dict(
-                checkpoint["optimizer_{model_name}_state_dict"])
+
+        optimizer.load_state_dict(
+            checkpoint["optimizer_state_dict"])
         start_iter = checkpoint["start_iter"]
 
     # Ensure that all loading by all processes is done before any process has started saving models
-    if cfg.setup_ddp == True:
+    if cfg.is_distributed == True:
         torch.distributed.barrier()
     return start_iter
 
@@ -177,15 +181,13 @@ def train(rank: int, cfg: CfgNode) -> None:
     """
     # Seed experiment for repeatability (Each process should sample different rays)
     seed = cfg.experiment.randomseed + rank
-    np.random.seed(seed)
-    torch.manual_seed(seed)
 
     # Set device and logdir_path
     device, logdir_path = None, None
-    if is_main_process(rank) or cfg.setup_ddp == False:
+    if is_main_process(rank) or cfg.is_distributed == False:
         logdir_path = prepare_logging(cfg)
         device = f"cuda:0"
-    if cfg.setup_ddp == True:
+    if cfg.is_distributed == True:
         device = f"cuda:{rank}"
         torch.cuda.set_device(rank)
 
@@ -193,25 +195,28 @@ def train(rank: int, cfg: CfgNode) -> None:
     train_dataloader, val_dataloader = prepare_dataloader(cfg)
 
     # Prepare Model, Optimizer, and load checkpoint
-    models = prepare_models(rank, cfg)
+    models = prepare_models(cfg)
     if is_main_process(rank):
         for _, model in models.items():
             wandb.watch(model)
-    optimizers, schedulers = prepare_optimizer(rank, cfg, models)
-    start_iter = load_checkpoint(rank, cfg, models, optimizers)
+
+    optimizer, scheduler = prepare_optimizer(cfg, models)
+    start_iter = load_checkpoint(rank, cfg, models, optimizer)
 
     # Prepare RaySampler
     first_data_sample = next(iter(train_dataloader))
     (height, width), intrinsic, datatype = first_data_sample["color"][0].shape[
         :2], first_data_sample["intrinsic"][0], first_data_sample["intrinsic"][0].dtype
 
-    ray_sampler = RaySampler(height,
+    ray_sampler = RaySampler(seed,
+                             height,
                              width,
                              intrinsic,
                              sample_size=cfg.nerf.train.num_random_rays,
                              device=device)
 
-    point_sampler = PointSampler(cfg.nerf.train.num_coarse,
+    point_sampler = PointSampler(seed,
+                                 cfg.nerf.train.num_coarse,
                                  cfg.dataset.near,
                                  cfg.dataset.far,
                                  spacing_mode=cfg.nerf.spacing_mode,
@@ -249,26 +254,23 @@ def train(rank: int, cfg: CfgNode) -> None:
 
         tgt_pixel_batch = train_data["color"].view(-1, 4)[select_inds, :]
 
+        # Batching to reduce loading time
+        ro_minibatches          = get_minibatches(ro_batch, cfg.nerf.train.chunksize)
+        rd_minibatches          = get_minibatches(rd_batch, cfg.nerf.train.chunksize)
+        tgt_pixel_minibatches   = get_minibatches(tgt_pixel_batch, cfg.nerf.train.chunksize)
+        num_batches = len(ro_minibatches)
+
+        msg = "Mismatch in batch length of ray origins, ray directions and target pixels"
+        assert num_batches == len(rd_minibatches) == len(
+            tgt_pixel_minibatches), msg
+
         weights, viewdirs, pts, z_vals = None, None, None, None
         coarse_loss, fine_loss = None, None
-
-        # Batching to reduce loading time
-        ro_minibatches = get_minibatches(
-            ro_batch, cfg.nerf.train.chunksize)
-        rd_minibatches = get_minibatches(
-            rd_batch, cfg.nerf.train.chunksize)
-        tgt_pixel_minibatches = get_minibatches(
-            tgt_pixel_batch, cfg.nerf.train.chunksize)
-        num_batches = len(ro_minibatches)
-        msg = "Mismatch in batch length of ray origins, ray directions and target pixels"
-        assert num_batches == len(rd_minibatches) == len(tgt_pixel_minibatches), msg
-
         for j, (ro, rd, target_pixels) in enumerate(zip(ro_minibatches, rd_minibatches, tgt_pixel_minibatches)):
-            logs = str()
             weights, viewdirs, pts, z_vals = None, None, None, None
             then = time.time()
+            loss = None
             for model_name, model in models.items():
-                optimizer, scheduler = optimizers[model_name], schedulers[model_name]
                 if model_name == "coarse":
                     pts, z_vals = point_sampler.sample_uniform(ro, rd)
                 else:
@@ -281,15 +283,14 @@ def train(rank: int, cfg: CfgNode) -> None:
                 embedded = embedder_xyz.embed(pts_flat)
                 if cfg.nerf.use_viewdirs:
                     viewdirs = rd
-                    viewdirs = viewdirs / viewdirs.norm(p=2, dim=-1).unsqueeze(-1)
+                    viewdirs = rd / viewdirs.norm(p=2, dim=-1).unsqueeze(-1)
                     input_dirs = viewdirs.repeat([1, z_vals.shape[-1], 1])
                     input_dirs_flat = input_dirs.reshape(-1, input_dirs.shape[-1])
                     embedded_dirs = embedder_dir.embed(input_dirs_flat)
                     embedded = torch.cat((embedded, embedded_dirs), dim=-1)
 
                 radiance_field = model(embedded)
-                radiance_field = radiance_field.reshape(
-                    list(z_vals.shape) + [radiance_field.shape[-1]])
+                radiance_field = radiance_field.reshape(list(z_vals.shape) + [radiance_field.shape[-1]])
 
                 (rgb, _, _, weights, _) = volume_render_radiance_field(
                     radiance_field,
@@ -297,30 +298,33 @@ def train(rank: int, cfg: CfgNode) -> None:
                     rd,
                     white_background=getattr(cfg.nerf, "train").white_background)
 
-                loss = torch.nn.functional.mse_loss(
-                    rgb[..., :3], target_pixels[..., :3])
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                psnr = mse2psnr(loss.item())
-                if is_main_process(rank):
-                    wandb.log({f"train/{model_name}_loss": loss.item(),
-                              f"train/{model_name}_psnr": psnr})
-                    logs += f"{model_name} Loss: {loss.item():>4.4f}, {model_name} PSNR: {psnr:>4.4f} "
+                if loss is None:
+                    loss = torch.nn.functional.mse_loss(
+                        rgb[..., :3], target_pixels[..., :3])
+                else:
+                    loss += torch.nn.functional.mse_loss(
+                        rgb[..., :3], target_pixels[..., :3])
+
+            optimizer.zero_grad()
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            psnr = mse2psnr(loss.item())
 
             i = load_iter * num_batches + j
 
             if is_main_process(rank) and i % cfg.experiment.print_every == 0 or load_iter == cfg.experiment.load_iters - 1:
-                print(f"[TRAIN] Iter: {i:>8} Time taken: {time.time() - then:>4.4f} {logs}")
+                wandb.log({f"train/loss": loss.item(), f"train/psnr": psnr})
+                print(f"[TRAIN] Iter: {i:>8} Time taken: {time.time() - then:>4.4f} Learning rate: {scheduler.get_lr():4.4f} Loss: {loss.item():>4.4f}, PSNR: {psnr:>4.4f}")
 
         if is_main_process(rank) and load_iter % cfg.experiment.save_every == 0 or load_iter == cfg.experiment.load_iters - 1:
             checkpoint_dict = {
                 "iter": i,
                 "model_coarse_state_dict": models["coarse"].state_dict(),
                 "model_fine_state_dict": models["fine"].state_dict(),
-                "optimizer_coarse_state_dict": optimizers["coarse"].state_dict(),
-                "optimizer_fine_state_dict": optimizers["fine"].state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
             }
             torch.save(checkpoint_dict, logdir_path / f"checkpoint{i:5d}.ckpt")
             print("================== Saved Checkpoint =================")
@@ -332,7 +336,7 @@ def train(rank: int, cfg: CfgNode) -> None:
             val_data = next(iter(val_dataloader))
 
             # Broadcast validation data in rank 0 to all the processes
-            if cfg.setup_ddp == True:
+            if cfg.is_distributed == True:
                 val_data = list(val_data.items())
                 torch.distributed.broadcast_object_list(val_data, 0)
                 val_data = dict(val_data)
@@ -351,7 +355,7 @@ def train(rank: int, cfg: CfgNode) -> None:
                                                          [embedder_xyz, embedder_dir],
                                                          device)
 
-            if is_main_process(rank) or cfg.setup_ddp == False:
+            if is_main_process(rank) or cfg.is_distributed == False:
                 assert rgb_coarse is not None, "Main process must contain rgb_coarse"
                 assert rgb_fine is not None, "Main process must contain rgb_fine"
 
@@ -379,7 +383,7 @@ def train(rank: int, cfg: CfgNode) -> None:
                            "validation/target": [wandb.Image(target_rgb[i, ..., :3].permute(2, 0, 1)) for i in range(val_data["color"].shape[0])]
                            })
                 print(
-                    f"[bold magenta][VAL  ][/bold magenta] Iter: {i:>8} Time taken: {time.time() - val_then:>4.4f} Loss: {loss.item():>4.4f}, PSNR: {psnr:>4.4f}")
+                    f"[VAL  ] Iter: {i:>8} Time taken: {time.time() - val_then:>4.4f} Loss: {loss.item():>4.4f}, PSNR: {psnr:>4.4f}")
 
 
 def parallel_image_render(rank: int,
@@ -388,11 +392,13 @@ def parallel_image_render(rank: int,
                           models: "OrderedDict[torch.nn.Module, torch.nn.Module]",
                           ray_sampler: RaySampler,
                           point_sampler: PointSampler,
-                          embedders: List[PositionalEmbedder],
+                          embedders: List[Union[PositionalEmbedder, None]],
                           device: torch.cuda.Device):
     """Parallely render images on multiple GPUs for validation
     """
     embedder_xyz, embedder_dir = embedders[0], embedders[1]
+    assert embedder_xyz is not None, "XYZ PositionalEmbedder is None "
+    assert embedder_dir is not None, "Direction PositionalEmbedder is None "
 
     for model_name, model in models.items():
         models[model_name].to(device)
@@ -449,8 +455,7 @@ def parallel_image_render(rank: int,
                     viewdirs = rd
                     viewdirs = viewdirs / viewdirs.norm(p=2, dim=-1).unsqueeze(-1)
                     input_dirs = viewdirs.repeat([1, z_vals.shape[-1], 1])
-                    input_dirs_flat = input_dirs.reshape(
-                        -1, input_dirs.shape[-1])
+                    input_dirs_flat = input_dirs.reshape(-1, input_dirs.shape[-1])
                     embedded_dirs = embedder_dir.embed(input_dirs_flat)
                     embedded = torch.cat((embedded, embedded_dirs), dim=-1)
 
@@ -472,18 +477,18 @@ def parallel_image_render(rank: int,
         rgb_coarse_batches = torch.cat(rgb_coarse_batches, dim=0)
         rgb_fine_batches = torch.cat(rgb_fine_batches, dim=0)
 
-        if cfg.setup_ddp == False:
+        if cfg.is_distributed == False:
             return rgb_coarse_batches, rgb_fine_batches
 
         # Pad image chunks to get equal chunksize for all_gather/gather
-        padded_rgb_coarse = torch.zeros(
-            (padding_per_process[rank], rgb_coarse_batches.shape[-1]), dtype=rgb_coarse_batches.dtype, device=rgb_coarse_batches.device)
-        padded_rgb_fine = torch.zeros(
-            (padding_per_process[rank], rgb_fine_batches.shape[-1]), dtype=rgb_fine_batches.dtype, device=rgb_fine_batches.device)
-        rgb_coarse_batches = torch.cat(
-            [rgb_coarse_batches, padded_rgb_coarse], dim=0)
-        rgb_fine_batches = torch.cat(
-            [rgb_fine_batches, padded_rgb_fine], dim=0)
+        padded_rgb_coarse = torch.zeros((padding_per_process[rank], rgb_coarse_batches.shape[-1]),
+                                        dtype=rgb_coarse_batches.dtype,
+                                        device=rgb_coarse_batches.device)
+        padded_rgb_fine = torch.zeros((padding_per_process[rank], rgb_fine_batches.shape[-1]),
+                                      dtype=rgb_fine_batches.dtype,
+                                      device=rgb_fine_batches.device)
+        rgb_coarse_batches = torch.cat([rgb_coarse_batches, padded_rgb_coarse], dim=0)
+        rgb_fine_batches = torch.cat([rgb_fine_batches, padded_rgb_fine], dim=0)
 
         all_rgb_coarse_batches = [torch.zeros_like(rgb_coarse_batches)
                                   for _ in range(cfg.gpus)]
@@ -517,6 +522,7 @@ def init_process(rank: int, fn: FunctionType, cfg: CfgNode, backend: str = "gloo
     os.environ["MASTER_PORT"] = "29500"
     dist.init_process_group(backend, rank=rank,  world_size=cfg.gpus)
     fn(rank, cfg)
+    torch.distributed.destroy_process_group()
 
 
 def main(cfg: CfgNode):
@@ -529,12 +535,13 @@ def main(cfg: CfgNode):
     # # (Optional:) enable this to track autograd issues when debugging
     # torch.autograd.set_detect_anomaly(True)
 
-    _, device_ids = prepare_device(cfg.gpus, cfg.setup_ddp)
+    _, device_ids = prepare_device(cfg.gpus, cfg.is_distributed)
 
-    if len(device_ids) > 1 and configargs.setup_ddp == True:
+    if len(device_ids) > 1 and configargs.is_distributed == True:
         # TODO: Setup DataDistributedParallel
         print(f"Using {len(device_ids)} GPUs for training")
-        mp.spawn(init_process, args=(train, cfg), nprocs=cfg.gpus, join=True)
+        mp.spawn(init_process, args=(train, cfg, "nccl"),
+                 nprocs=cfg.gpus, join=True)
     else:
         train(0, cfg)
 
@@ -552,9 +559,10 @@ if __name__ == "__main__":
     )
     parser.add_argument('-g', '--gpus', default=1, type=int,
                         help='Number of gpus per node')
-    parser.add_argument("--setup-ddp", type=bool, default=False,
+    parser.add_argument("--distributed", action='store_true', dest="is_distributed",
                         help="Run the models in DataDistributedParallel")
     configargs = parser.parse_args()
+
     # Read config file.
     cfg = CfgNode(vars(configargs), new_allowed=True)
     cfg.merge_from_file(configargs.config)

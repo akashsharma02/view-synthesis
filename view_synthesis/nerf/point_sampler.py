@@ -8,9 +8,12 @@ class PointSampler(object):
 
     """Sample 3D points along the given rays"""
 
-    def __init__(self, num_samples: int, near: float, far: float, spacing_mode: Literal["lindisp", "lindepth"], perturb: bool, dtype: DTypeLike, device: torch.cuda.Device):
+    def __init__(self, seed, num_samples: int, near: float, far: float, spacing_mode: Literal["lindisp", "lindepth"], perturb: bool, dtype: DTypeLike, device: torch.cuda.Device):
         assert num_samples > 0, "Number of samples along a ray should be positive integer"
         assert near >= 0 and far > near, "Near and far ranges should be positive values, and far > near"
+        self.torch_rng = torch.Generator(device=device)
+        self.torch_rng.manual_seed(seed)
+
         self.num_samples = num_samples
         self.near = near
         self.far = far
@@ -32,6 +35,10 @@ class PointSampler(object):
             self.z_vals = 1.0 / \
                 (1.0 / near * (1.0 - self.t_vals) + 1.0 / far * self.t_vals)
 
+        self.mids = 0.5 * (self.z_vals[..., 1:] + self.z_vals[..., :-1])
+        self.upper = torch.cat((self.mids, self.z_vals[..., -1:]), dim=-1)
+        self.lower = torch.cat((self.z_vals[..., :1], self.mids), dim=-1)
+
     def sample_uniform(self, ro: torch.Tensor, rd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """ Uniform sample points according to spacing mode along the ray
 
@@ -44,14 +51,14 @@ class PointSampler(object):
 
         """
         num_random_rays = ro.shape[-2]
-        z_vals = self.z_vals.expand(num_random_rays, self.num_samples)
 
         if self.perturb:
-            mids = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
-            upper = torch.cat((mids, z_vals[..., -1:]), dim=-1)
-            lower = torch.cat((z_vals[..., :1], mids), dim=-1)
-            t_rand = torch.rand(z_vals.shape, dtype=ro.dtype, device=ro.device)
+            upper = self.upper.expand(num_random_rays, self.num_samples)
+            lower = self.lower.expand(num_random_rays, self.num_samples)
+            t_rand = torch.rand(upper.size(), generator=self.torch_rng, dtype=ro.dtype, device=ro.device)
             z_vals = lower + (upper - lower) * t_rand
+        else:
+            z_vals = self.z_vals.expand(num_random_rays, self.num_samples)
 
         assert z_vals.shape == torch.Size(
             [num_random_rays, self.num_samples]), "Incorrect shape of depth samples z_vals"
@@ -68,10 +75,8 @@ class PointSampler(object):
 
         """
         num_random_rays = ro.shape[-2]
-        z_vals = self.z_vals.expand(num_random_rays, self.num_samples)
 
-        bins = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
-
+        bins = self.mids.expand(num_random_rays, self.num_samples - 1)
         weights = weights + 1e-5
         pdf = weights / torch.sum(weights, dim=-1, keepdim=True)
         cdf = torch.cumsum(pdf, dim=-1)
@@ -83,6 +88,7 @@ class PointSampler(object):
         if self.perturb:
             u = torch.rand(
                 list(cdf.shape[:-1]) + [self.num_samples],
+                generator=self.torch_rng,
                 dtype=weights.dtype,
                 device=weights.device,
             )
@@ -113,6 +119,7 @@ class PointSampler(object):
 
         z_samples = samples.detach()
 
+        z_vals = self.z_vals.expand(num_random_rays, self.num_samples)
         z_vals, _ = torch.sort(torch.cat((z_vals, z_samples), dim=-1), dim=-1)
         pts = ro[..., None, :] + rd[..., None, :] * z_vals[..., :, None]
 

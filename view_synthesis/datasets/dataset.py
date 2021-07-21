@@ -78,10 +78,10 @@ class CarInteriorDataset(torch.utils.data.Dataset):
         normal_img = imageio.imread(normal_img_fname)
         pose = np.loadtxt(pose_fname).reshape(4, 4)
 
-        color_img = (np.array(color_img) / 255.0)
-        depth_img = (np.array(depth_img) * self.max_depth / 65535.0)
+        color_img = color_img / 255.0
+        depth_img = depth_img * self.max_depth / 65535.0
         depth_img = depth_img[..., 0][..., None]
-        normal_img = (np.array(normal_img) / 255.0)
+        normal_img = normal_img / 255.0
 
         sample = {'color': color_img.astype(np.float32),
                   'depth': depth_img.astype(np.float32),
@@ -180,10 +180,9 @@ class BlenderNeRFDataset(torch.utils.data.Dataset):
             pose[:3, :3]), 1), "Incorrect rotation does not determinant = 1"
 
         color_img = imageio.imread(color_img_fname)
-        color_img = (np.array(color_img) / 255.0)
+        color_img = (color_img / 255.0)
 
-        sample = {'color': color_img.astype(np.float32), 'pose': pose.astype(
-            np.float32), 'intrinsic': np.copy(self.intrinsic).astype(np.float32)}
+        sample = {'color': color_img.astype(np.float32), 'pose': pose.astype(np.float32), 'intrinsic': np.copy(self.intrinsic).astype(np.float32)}
 
         if self.resolution_level != 1:
             H, W = color_img.shape[:2]

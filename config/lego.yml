@@ -7,8 +7,7 @@ experiment:
   # Seed for random number generators (for repeatability).
   randomseed: 42  # Cause, why not?
   # Number of training iterations.
-  load_iters: 2000
-  convergence_lr: 1e-7
+  load_iters: 20000
   # Number of training iterations after which to validate.
   validate_every: 2
   # Number of training iterations after which to checkpoint.
@@ -23,7 +22,7 @@ dataset:
   # Base directory of dataset.
   basedir: /home/fyusion/Documents/datasets/nerf_synthetic/lego
   # Training batch size (number of images to sample per training step)
-  train_batch_size: 16
+  train_batch_size: 4
   # Validation batch size (number of images to sample per validation step
   val_batch_size: 1
   # For the Blender datasets (synthetic), optionally return images
@@ -113,6 +112,8 @@ optimizer:
   # Scheduler to use
   scheduler_type: LambdaLR
   # Custom arguments for scheduler according to scheduler type
+  scheduler_gamma: 0.1
+  scheduler_step_size: 5000
   scheduler_args:
     # Multiplicative factor applied every step size number of iterations
       lr_lambda: exponential
@@ -142,7 +143,7 @@ nerf:
     num_random_rays: 131072  # 32 * 32 * 128 Needs to be less than image size
     # Size of each chunk (rays are batched into "chunks" and passed through
     # the network)
-    chunksize: 8192
+    chunksize: 4096
     # Whether or not to perturb the sampled depth values.
     perturb: True
     # Number of depth samples per ray for the coarse network.
@@ -158,7 +159,7 @@ nerf:
   validation:
     # Number of random rays to retain from each image.
     # These sampled rays are used for training, and the others are discarded.
-    chunksize: 16384   # 1024 * 16
+    chunksize: 8192   # 1024 * 16
     # Whether or not to perturb the sampled depth values.
     perturb: False
     # Number of depth samples per ray for the coarse network.

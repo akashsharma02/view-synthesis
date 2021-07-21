@@ -32,17 +32,11 @@ def volume_render_radiance_field(
     white_background=False,
 ):
     # TESTED
-    one_e_10 = torch.tensor(
-        [1e10], dtype=ray_directions.dtype, device=ray_directions.device
-    )
-    dists = torch.cat(
-        (
-            depth_values[..., 1:] - depth_values[..., :-1],
-            # I don't understand the purpose of concatenating one_e_10 to the vector to compute distance between samples
-            one_e_10.expand(depth_values[..., :1].shape),
-        ),
-        dim=-1,
-    )
+    one_e_10 = torch.full_like(depth_values[..., :1], 1e10)
+    dists = depth_values[..., 1:] - depth_values[..., :-1]
+    # Add distance from far-limit to infinity to retain shape (64 samples or 128 samples)
+    dists = torch.cat((dists, one_e_10), dim=-1)
+
     dists = dists * ray_directions[..., None, :].norm(p=2, dim=-1)
 
     rgb = torch.sigmoid(radiance_field[..., :3])
