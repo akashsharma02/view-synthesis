@@ -3,6 +3,7 @@ import math
 import torch
 from pathlib import Path
 import wandb
+import torch.distributed as dist
 
 from view_synthesis.cfgnode import CfgNode
 
@@ -34,10 +35,10 @@ def prepare_device(n_gpus_to_use: int, is_distributed: bool) -> Tuple[torch.devi
     return main_device, list_ids
 
 
-def is_main_process(rank: int) -> bool:
+def is_main_process() -> bool:
     """ Test whether process is the main worker process
     """
-    return rank == 0
+    return dist.get_rank() == 0
 
 
 def prepare_logging(cfg: CfgNode):

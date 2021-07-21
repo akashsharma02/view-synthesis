@@ -7,7 +7,7 @@ experiment:
   # Seed for random number generators (for repeatability).
   randomseed: 42  # Cause, why not?
   # Number of training iterations.
-  load_iters: 20000
+  load_iters: 500
   # Number of training iterations after which to validate.
   validate_every: 2
   # Number of training iterations after which to checkpoint.
@@ -109,22 +109,9 @@ optimizer:
   type: Adam
   # Learning rate.
   lr: 5.0E-3
-  # Scheduler to use
-  scheduler_type: LambdaLR
   # Custom arguments for scheduler according to scheduler type
   scheduler_gamma: 0.1
-  scheduler_step_size: 5000
-  scheduler_args:
-    # Multiplicative factor applied every step size number of iterations
-      lr_lambda: exponential
-
-
-# Learning rate schedule.
-scheduler:
-  # Exponentially decay learning rate (in 1000 steps)
-  lr_decay: 250
-  # Rate at which to apply this decay.
-  lr_decay_factor: 0.1
+  scheduler_step_size: 50000
 
 # NeRF parameters.
 nerf:
