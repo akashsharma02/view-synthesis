@@ -24,18 +24,16 @@ def cumprod_exclusive(tensor: torch.Tensor) -> torch.Tensor:
 
     return cumprod
 
-def volume_render_radiance_field(
+def volume_render(
     radiance_field,
     depth_values,
     ray_directions,
     radiance_field_noise_std=0.0,
     white_background=False,
 ):
-    # TESTED
-    one_e_10 = torch.full_like(depth_values[..., :1], 1e10)
     dists = depth_values[..., 1:] - depth_values[..., :-1]
     # Add distance from far-limit to infinity to retain shape (64 samples or 128 samples)
-    dists = torch.cat((dists, one_e_10), dim=-1)
+    dists = torch.cat((dists, torch.full_like(dists[..., :1], 1e10)), dim=-1)
 
     dists = dists * ray_directions[..., None, :].norm(p=2, dim=-1)
 

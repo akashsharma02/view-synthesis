@@ -10,17 +10,15 @@ class RaySampler(object):
 
     """RaySampler samples rays for a given image size and intrinsics """
 
-    def __init__(self, seed, height: int, width: int, intrinsics: Union[torch.Tensor, np.ndarray], sample_size: int, device: torch.cuda.Device):
+    def __init__(self, height: int, width: int, intrinsics: Union[torch.Tensor, np.ndarray], sample_size: int, device: torch.cuda.Device):
         """ Prepares a ray bundle for a given image size and intrinsics
 
         :Function: intrinsics: torch.Tensor 4x4
 
         """
         assert height > 0 and width > 0, "Height and width must be positive integers"
-        assert sample_size > 0 and sample_size < height * \
-            width, "Sample size must be a positive number less than height * width"
+        assert sample_size > 0 and sample_size < height * width, "Sample size must be a positive number less than height * width"
 
-        self.rng = np.random.default_rng(seed)
         self.height = height
         self.width = width
         self.sample_size = sample_size
@@ -67,15 +65,24 @@ class RaySampler(object):
         batch_size = tform_cam2world.shape[0]
 
         ray_origins, ray_directions = self.get_bundle(tform_cam2world)
-        ro, rd = ray_origins.reshape(-1, 3), ray_directions.reshape(-1, 3)
+        ray_origins, ray_directions = ray_origins.flatten(1, 2), ray_directions.flatten(1, 2)
+        # ro, rd = ray_origins.reshape(-1, 3), ray_directions.reshape(-1, 3)
 
-        select_inds = self.rng.choice(
-            ro.shape[-2], size=(
-                self.sample_size*batch_size), replace=False
-        )
+        select_inds = np.array([np.random.choice(ray_origins.shape[-2], self.sample_size, replace=False) for _ in range(batch_size)])
 
-        ray_origins = ro[select_inds, :]
-        ray_directions = rd[select_inds, :]
+        # print(select_inds, select_inds.shape)
+        ray_origins = [ray_origins[i, select_inds[i], :] for i in range(batch_size)]
+        ray_directions = [ray_directions[i, select_inds[i], :] for i in range(batch_size)]
+        ray_origins = torch.cat(ray_origins, dim=0).reshape(-1, 3)
+        ray_directions = torch.cat(ray_directions, dim=0).reshape(-1, 3)
+
+        # select_inds = np.random.choice(
+        #     ro.shape[-2], size=(
+        #         self.sample_size*batch_size), replace=False
+        # )
+
+        # ray_origins = ro[select_inds, :]
+        # ray_directions = rd[select_inds, :]
 
         return ray_origins, ray_directions, select_inds
 
@@ -117,7 +124,7 @@ if __name__ == "__main__":
     from view_synthesis.datasets.dataset import BlenderNeRFDataset
     dataset = BlenderNeRFDataset(args.dataset_dir, resolution_level=32, mode="val")
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=2, shuffle=True, num_workers=0)
+        dataset, batch_size=1, shuffle=True, num_workers=0)
 
     first_data_sample = next(iter(dataloader))
 
@@ -132,8 +139,7 @@ if __name__ == "__main__":
     else:
         device = "cpu"
 
-    ray_sampler = RaySampler(seed,
-        height, width, intrinsic[0], sample_size=args.num_random_rays, device=device)
+    ray_sampler = RaySampler(height, width, intrinsic[0], sample_size=args.num_random_rays, device=device)
     pose = first_data_sample["pose"].to(device)
     ro, rd = ray_sampler.get_bundle(pose)
     ray_origins, ray_directions, select_inds = ray_sampler.sample(
@@ -145,3 +151,4 @@ if __name__ == "__main__":
     print(f"Ray directions:\n {ray_directions}")
     print(f"select indices:\n {select_inds}")
     print(f"Pose origin:\n {pose[:, :3, 3]}")
+    print(f"Pose:\n {pose}")

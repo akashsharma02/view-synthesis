@@ -35,14 +35,14 @@ def prepare_device(n_gpus_to_use: int, is_distributed: bool) -> Tuple[torch.devi
     return main_device, list_ids
 
 
-def is_main_process() -> bool:
+def is_main_process(is_distributed) -> bool:
     """ Test whether process is the main worker process
     """
-    return dist.get_rank() == 0
+    return (dist.get_rank() == 0) if is_distributed else True
 
 
-def prepare_logging(cfg: CfgNode):
-    """TODO: Docstring for prepare_logging.
+def prepare_experiment(cfg: CfgNode):
+    """TODO: Docstring for prepare_experiment.
 
     :function: TODO
     :returns: TODO
