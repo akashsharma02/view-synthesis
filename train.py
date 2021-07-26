@@ -235,7 +235,7 @@ def train(rank: int, cfg: CfgNode) -> None:
 
     """
     # Seed experiment for repeatability (Each process should sample different rays)
-    seed = cfg.experiment.randomseed + rank
+    seed = (rank + 1) * cfg.experiment.randomseed
     np.random.seed(seed)
     torch.manual_seed(seed)
 
@@ -410,30 +410,25 @@ def train(rank: int, cfg: CfgNode) -> None:
 
                     target_pixels = val_data["color"].view(-1, 4)
 
-                    coarse_loss = torch.nn.functional.mse_loss(
-                        rgb_coarse[..., :3], target_pixels[..., :3])
+                    coarse_loss = torch.nn.functional.mse_loss(rgb_coarse[..., :3], target_pixels[..., :3])
                     loss = coarse_loss
                     psnr = mse2psnr(coarse_loss.item())
 
-                    target_rgb = target_pixels.reshape(
-                        list(val_data["color"].shape[:-1]) + [4])
-                    rgb_coarse = rgb_coarse.reshape(
-                        list(val_data["color"].shape[:-1]) + [rgb_coarse.shape[-1]])
+                    target_rgb = target_pixels.reshape(list(val_data["color"].shape[:-1]) + [4])
+                    rgb_coarse = rgb_coarse.reshape(list(val_data["color"].shape[:-1]) + [rgb_coarse.shape[-1]])
 
-                    wandb.log({"validation/loss": loss.item(),
-                               "validation/psnr": psnr,
-                               "validation/rgb_coarse": [wandb.Image(rgb_coarse[i, ...].permute(2, 0, 1)) for i in range(rgb_coarse.shape[0])],
+                    wandb.log({"validation/rgb_coarse": [wandb.Image(rgb_coarse[i, ...].permute(2, 0, 1)) for i in range(rgb_coarse.shape[0])],
                                "validation/target": [wandb.Image(target_rgb[i, ..., :3].permute(2, 0, 1)) for i in range(val_data["color"].shape[0])]
                                })
 
                     if hasattr(cfg.models, "fine"):
-                        fine_loss = torch.nn.functional.mse_loss(
-                            rgb_fine[..., :3], target_pixels[..., :3])
+                        fine_loss = torch.nn.functional.mse_loss(rgb_fine[..., :3], target_pixels[..., :3])
                         loss += fine_loss
                         psnr = mse2psnr(fine_loss.item())
-                        rgb_fine = rgb_fine.reshape(
-                            list(val_data["color"].shape[:-1]) + [rgb_fine.shape[-1]])
+                        rgb_fine = rgb_fine.reshape(list(val_data["color"].shape[:-1]) + [rgb_fine.shape[-1]])
                         wandb.log({"validation/rgb_fine": [wandb.Image(rgb_fine[i, ...].permute(2, 0, 1)) for i in range(rgb_fine.shape[0])]})
+
+                    wandb.log({"validation/loss": loss.item(), "validation/psnr": psnr})
                     print(f"[VAL  ] Iter: {i:>8} Iteration: {iteration:>8} Time taken: {time.time() - val_then:>4.4f} Loss: {loss.item():>4.4f} PSNR: {psnr:>4.4f}")
 
 
@@ -456,51 +451,51 @@ def parallel_image_render(rank: int,
         model.eval()
 
     with torch.no_grad():
-        ray_origins, ray_directions = ray_sampler.get_bundle(
-            tform_cam2world=pose)
+        ray_origins, ray_directions = ray_sampler.get_bundle(tform_cam2world=pose)
         ro, rd = ray_origins.reshape(-1, 3), ray_directions.reshape(-1, 3)
         num_rays = ro.shape[0]
 
-        batchsize_per_process = torch.full(
-            [cfg.gpus], (num_rays / cfg.gpus), dtype=int)
+        batchsize_per_process = torch.full([cfg.gpus], (num_rays / cfg.gpus), dtype=int)
         padding = num_rays - torch.sum(batchsize_per_process)
-        batchsize_per_process[-1] = num_rays - \
-            torch.sum(batchsize_per_process[:-1])
-        assert torch.sum(
-            batchsize_per_process) == num_rays, "Mismatch in batchsize per process and total number of rays"
+        batchsize_per_process[-1] = num_rays - torch.sum(batchsize_per_process[:-1])
+        assert torch.sum(batchsize_per_process) == num_rays, "Mismatch in batchsize per process and total number of rays"
 
         padding_per_process = torch.zeros([cfg.gpus], dtype=int)
         if padding > 0:
             padding_per_process[:-1] = padding
-        assert padding + \
-            batchsize_per_process[0] == batchsize_per_process[-1], "Incorrect calculation of padding"
+        assert padding + batchsize_per_process[0] == batchsize_per_process[-1], "Incorrect calculation of padding"
 
         # Only use the split of the rays for the current process
-        ro_batch = torch.split(ro, batchsize_per_process.tolist())[
-            rank].to(device)
-        rd_batch = torch.split(rd, batchsize_per_process.tolist())[
-            rank].to(device)
+        ro_batch = torch.split(ro, batchsize_per_process.tolist())[rank].to(device)
+        rd_batch = torch.split(rd, batchsize_per_process.tolist())[rank].to(device)
 
         # Minibatch the rays allocated to current process
-        ro_minibatches = get_minibatches(
-            ro_batch, cfg.nerf.validation.chunksize)
-        rd_minibatches = get_minibatches(
-            rd_batch, cfg.nerf.validation.chunksize)
+        ro_minibatches = get_minibatches(ro_batch, cfg.nerf.validation.chunksize)
+        rd_minibatches = get_minibatches(rd_batch, cfg.nerf.validation.chunksize)
 
         rgb_coarse_batches, rgb_fine_batches = [], []
         for ro, rd in zip(ro_minibatches, rd_minibatches):
+
             # Pass through coarse model
             pts_coarse, z_vals_coarse = point_sampler.sample_uniform(ro, rd)
 
             radiance_field_coarse = nerf_forward_pass(models["coarse"], [embedder_xyz, embedder_dir], rd, pts_coarse)
-            (rgb_coarse, _, _, weights, _) = volume_render(radiance_field_coarse, z_vals_coarse, rd, radiance_field_noise_std=cfg.nerf.validation.radiance_field_noise_std, white_background=cfg.nerf.train.white_background)
+            (rgb_coarse, _, _, weights, _) = volume_render(radiance_field_coarse,
+                                                           z_vals_coarse,
+                                                           rd,
+                                                           radiance_field_noise_std=cfg.nerf.validation.radiance_field_noise_std,
+                                                           white_background=cfg.nerf.train.white_background)
             rgb_coarse_batches.append(rgb_coarse)
 
             # Pass through fine model
             if hasattr(cfg.models, "fine"):
                 pts_fine, z_vals_fine = point_sampler.sample_pdf(ro, rd, weights[..., 1:-1], z_vals_coarse)
                 radiance_field_fine = nerf_forward_pass(models["fine"], [embedder_xyz, embedder_dir], rd, pts_fine)
-                (rgb_fine, _, _, weights, _) = volume_render(radiance_field_fine, z_vals_fine, rd, radiance_field_noise_std=cfg.nerf.validation.radiance_field_noise_std, white_background=cfg.nerf.train.white_background)
+                (rgb_fine, _, _, weights, _) = volume_render(radiance_field_fine,
+                                                             z_vals_fine,
+                                                             rd,
+                                                             radiance_field_noise_std=cfg.nerf.validation.radiance_field_noise_std,
+                                                             white_background=cfg.nerf.train.white_background)
                 rgb_fine_batches.append(rgb_fine)
 
         rgb_coarse_batches = torch.cat(rgb_coarse_batches, dim=0)
@@ -517,6 +512,10 @@ def parallel_image_render(rank: int,
         rgb_coarse_batches = torch.cat([rgb_coarse_batches, padded_rgb_coarse], dim=0)
         all_rgb_coarse_batches = [torch.zeros_like(rgb_coarse_batches) for _ in range(cfg.gpus)]
         torch.distributed.all_gather(all_rgb_coarse_batches, rgb_coarse_batches)
+        if is_main_process(cfg.is_distributed):
+            for i, size in enumerate(batchsize_per_process):
+                all_rgb_coarse_batches[i] = all_rgb_coarse_batches[i][:size, ...]
+            all_rgb_coarse_batches = torch.cat(all_rgb_coarse_batches, dim=0)
 
         if hasattr(cfg.models, "fine"):
             padded_rgb_fine = torch.zeros((padding_per_process[rank], rgb_fine_batches.shape[-1]),
@@ -525,21 +524,15 @@ def parallel_image_render(rank: int,
             rgb_fine_batches = torch.cat([rgb_fine_batches, padded_rgb_fine], dim=0)
             all_rgb_fine_batches = [torch.zeros_like(rgb_fine_batches) for _ in range(cfg.gpus)]
             torch.distributed.all_gather(all_rgb_fine_batches, rgb_fine_batches)
-
-        # Return only from main_process
-        if is_main_process(cfg.is_distributed):
-            for i, size in enumerate(batchsize_per_process):
-                all_rgb_coarse_batches[i] = all_rgb_coarse_batches[i][:size, ...]
-            all_rgb_coarse_batches = torch.cat(all_rgb_coarse_batches, dim=0)
-
-            all_rgb_fine_batches = None
-            if hasattr(cfg.models, "fine"):
+            if is_main_process(cfg.is_distributed):
                 for i, size in enumerate(batchsize_per_process):
                     all_rgb_fine_batches[i] = all_rgb_fine_batches[i][:size, ...]
                 all_rgb_fine_batches = torch.cat(all_rgb_fine_batches, dim=0)
-            return all_rgb_coarse_batches, all_rgb_fine_batches
-        else:
-            return None, None
+
+    if is_main_process(cfg.is_distributed):
+        return all_rgb_coarse_batches, all_rgb_fine_batches
+    else:
+        return None, None
 
 
 def init_process(rank: int, fn: FunctionType, cfg: CfgNode, backend: str = "gloo"):

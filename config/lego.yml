@@ -36,10 +36,10 @@ optimizer:
 
 nerf:
     ray_sampler:
-        num_random_rays: 2048
+        num_random_rays: 1024
     point_sampler:
         num_coarse: 64
-        num_fine: 64
+        num_fine: 128
         near_limit: 2
         far_limit: 6
         spacing_mode: "lindepth"
@@ -53,7 +53,7 @@ nerf:
         include_input_dir: True
         log_sampling_dir: True
     train:
-        chunksize: 2048
+        chunksize: 1024
         white_background: False
         radiance_field_noise_std: 0.2
     validation:
