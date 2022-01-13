@@ -4,7 +4,7 @@ from types import FunctionType
 import os
 import time
 import argparse
-import wandb
+from torch.utils.tensorboard import SummaryWriter
 import yaml
 from pathlib import Path
 from collections import OrderedDict
@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from apex.parallel import DistributedDataParallel as ddp
+from torch.nn.parallel import DistributedDataParallel as ddp
 
 from view_synthesis.cfgnode import CfgNode
 import view_synthesis.datasets as datasets
@@ -248,6 +248,8 @@ def train(rank: int, cfg: CfgNode) -> None:
         device = f"cuda:{rank}"
         torch.cuda.set_device(rank)
 
+    writer = SummaryWriter(logdir_path)
+
     # Load Data
     train_dataloader, val_dataloader = prepare_dataloader(cfg)
 
@@ -302,9 +304,9 @@ def train(rank: int, cfg: CfgNode) -> None:
         # print(ro_batch.shape, rd_batch.shape, tgt_pixel_batch.shape)
         # Batching to reduce loading time
         assert cfg.nerf.train.chunksize >= cfg.nerf.ray_sampler.num_random_rays, "Chunksize needs to atleast be equal to the number of rays sampled from a single image"
-        ro_minibatches                  = get_minibatches(ro_batch, cfg.nerf.train.chunksize)
-        rd_minibatches                  = get_minibatches(rd_batch, cfg.nerf.train.chunksize)
-        tgt_pixel_minibatches           = get_minibatches(tgt_pixel_batch, cfg.nerf.train.chunksize)
+        ro_minibatches = get_minibatches(ro_batch, cfg.nerf.train.chunksize)
+        rd_minibatches = get_minibatches(rd_batch, cfg.nerf.train.chunksize)
+        tgt_pixel_minibatches = get_minibatches(tgt_pixel_batch, cfg.nerf.train.chunksize)
 
         num_batches = len(ro_minibatches)
         msg = "Mismatch in batch length of ray origins, ray directions and target pixels"
@@ -358,10 +360,13 @@ def train(rank: int, cfg: CfgNode) -> None:
             i = iteration * num_batches + j
 
             if is_main_process(cfg.is_distributed) and i % cfg.experiment.print_every == 0:
-                wandb.log({f"train/coarse_loss": coarse_loss.item(), f"train/psnr": psnr})
+                writer.add_scalar("train/coarse_loss", coarse_loss.item(), i)
+                writer.add_scalar("train/fine_loss", fine_loss.item(), i)
+                writer.add_scalar("train/psnr", psnr, i)
+                writer.add_scalar("train/learning_rate", scheduler.get_last_lr()[0], i)
+
                 log_string = f"[TRAIN] Iter: {i:>8} Load Iter: {iteration:>8} Time taken: {time_taken:>4.4f} Learning rate: {scheduler.get_last_lr()[0]:4.4f} Coarse Loss: {coarse_loss.item():>4.4f} "
                 if hasattr(cfg.models, "fine"):
-                    wandb.log({f"train/fine_loss": fine_loss.item()})
                     log_string += f"Fine Loss: {fine_loss.item():>4.4f} "
                 log_string += f"PSNR: {psnr:>4.4f}"
                 print(log_string)
@@ -417,18 +422,24 @@ def train(rank: int, cfg: CfgNode) -> None:
                     target_rgb = target_pixels.reshape(list(val_data["color"].shape[:-1]) + [4])
                     rgb_coarse = rgb_coarse.reshape(list(val_data["color"].shape[:-1]) + [rgb_coarse.shape[-1]])
 
-                    wandb.log({"validation/rgb_coarse": [wandb.Image(rgb_coarse[i, ...].permute(2, 0, 1)) for i in range(rgb_coarse.shape[0])],
-                               "validation/target": [wandb.Image(target_rgb[i, ..., :3].permute(2, 0, 1)) for i in range(val_data["color"].shape[0])]
-                               })
+                    writer.add_scalar("val/coarse_loss", coarse_loss, i)
+                    writer.add_images(
+                        "val/rgb_coarse_image", rgb_coarse[..., :3], i, dataformats='NHWC'
+                    )
+                    writer.add_images(
+                        "val/target_image", target_rgb[..., :3], i, dataformats='NHWC'
+                    )
 
                     if hasattr(cfg.models, "fine"):
                         fine_loss = torch.nn.functional.mse_loss(rgb_fine[..., :3], target_pixels[..., :3])
                         loss += fine_loss
                         psnr = mse2psnr(fine_loss.item())
                         rgb_fine = rgb_fine.reshape(list(val_data["color"].shape[:-1]) + [rgb_fine.shape[-1]])
-                        wandb.log({"validation/rgb_fine": [wandb.Image(rgb_fine[i, ...].permute(2, 0, 1)) for i in range(rgb_fine.shape[0])]})
+                        writer.add_scalar("val/fine_loss", fine_loss, i)
+                        writer.add_images(
+                            "val/rgb_fine_image", rgb_fine[..., :3], i, dataformats='NHWC'
+                        )
 
-                    wandb.log({"validation/loss": loss.item(), "validation/psnr": psnr})
                     print(f"[VAL  ] Iter: {i:>8} Iteration: {iteration:>8} Time taken: {time.time() - val_then:>4.4f} Loss: {loss.item():>4.4f} PSNR: {psnr:>4.4f}")
 
 

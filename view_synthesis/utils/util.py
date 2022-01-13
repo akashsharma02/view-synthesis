@@ -2,11 +2,9 @@ from typing import Tuple, List, Optional
 import math
 import torch
 from pathlib import Path
-import wandb
 import torch.distributed as dist
 
 from view_synthesis.cfgnode import CfgNode
-
 
 
 def prepare_device(n_gpus_to_use: int, is_distributed: bool) -> Tuple[torch.device, List[int]]:
@@ -48,8 +46,6 @@ def prepare_experiment(cfg: CfgNode):
     :returns: TODO
 
     """
-    wandb.init(project="ibr-view-synthesis", config=cfg)
-
     logdir_path = Path(cfg.experiment.logdir) / cfg.experiment.id
     logdir_path.mkdir(parents=True, exist_ok=True)
     with open(Path(logdir_path) / "config.yml", "w") as f:
@@ -91,4 +87,3 @@ def meshgrid_xy(
     # TESTED
     ii, jj = torch.meshgrid(tensor1, tensor2)
     return ii.transpose(-1, -2), jj.transpose(-1, -2)
-
