@@ -1,14 +1,12 @@
-from typing import Dict, List, Tuple, Union, Literal
+from typing import List, Tuple, Union
 from numpy.typing import DTypeLike
 from types import FunctionType
 import os
 import time
 import argparse
 from torch.utils.tensorboard import SummaryWriter
-import yaml
 from pathlib import Path
 from collections import OrderedDict
-import cv2
 
 import numpy as np
 import torch
@@ -52,11 +50,26 @@ def prepare_dataloader(cfg: CfgNode) -> Tuple[torch.utils.data.DataLoader, torch
         num_samples=cfg.experiment.iterations
     )
 
+    if cfg.is_distributed:
+        train_sampler = torch.utils.data.DistributedSampler(
+            train_dataset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            drop_last=False
+        )
+
+        val_sampler = torch.utils.data.DistributedSampler(
+            val_dataset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            drop_last=False
+        )
+
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=cfg.dataset.train_batch_size, shuffle=False, num_workers=0, sampler=train_sampler, pin_memory=True)
+        train_dataset, batch_size=cfg.dataset.train_batch_size, shuffle=False, num_workers=0, sampler=train_sampler, pin_memory=False)
 
     val_dataloader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=cfg.dataset.val_batch_size, shuffle=False, num_workers=0, sampler=val_sampler, pin_memory=True)
+        val_dataset, batch_size=cfg.dataset.val_batch_size, shuffle=False, num_workers=0, sampler=val_sampler, pin_memory=False)
 
     return train_dataloader, val_dataloader
 
@@ -99,10 +112,10 @@ def prepare_models(cfg: CfgNode) -> "OrderedDict[torch.nn.Module, Union[torch.nn
         )
         models["fine"].to(rank)
 
-    if cfg.is_distributed == True:
-        models["coarse"] = ddp(models['coarse'])
+    if cfg.is_distributed:
+        models["coarse"] = ddp(models['coarse'], device_ids=[rank], output_device=rank)
         if hasattr(cfg.models, "fine"):
-            models["fine"] = ddp(models['coarse'])
+            models["fine"] = ddp(models['fine'], device_ids=[rank], output_device=rank)
 
     return models
 
@@ -243,7 +256,7 @@ def train(rank: int, cfg: CfgNode) -> None:
     device, logdir_path = None, None
     if is_main_process(cfg.is_distributed):
         logdir_path = prepare_experiment(cfg)
-        device = f"cuda:0"
+        device = "cuda:0"
     else:
         device = f"cuda:{rank}"
         torch.cuda.set_device(rank)
@@ -290,6 +303,7 @@ def train(rank: int, cfg: CfgNode) -> None:
         for _, model in models.items():
             model.train()
 
+        train_dataloader.sampler.set_epoch(iteration)
         train_data = next(iter(train_dataloader))
         for key, value in train_data.items():
             if torch.is_tensor(value):
@@ -299,11 +313,11 @@ def train(rank: int, cfg: CfgNode) -> None:
         tgt_pixel_batch = train_data["color"].flatten(1, 2)
         tgt_pixel_batch = [tgt_pixel_batch[i, select_inds[i], :] for i in range(cfg.dataset.train_batch_size)]
         tgt_pixel_batch = torch.cat(tgt_pixel_batch, dim=0).reshape(-1, 4)
-        # tgt_pixel_batch                 = train_data["color"].view(-1, 4)[select_inds, :]
 
         # print(ro_batch.shape, rd_batch.shape, tgt_pixel_batch.shape)
         # Batching to reduce loading time
-        assert cfg.nerf.train.chunksize >= cfg.nerf.ray_sampler.num_random_rays, "Chunksize needs to atleast be equal to the number of rays sampled from a single image"
+        msg = "Chunksize needs to atleast be equal to the number of rays sampled from a single image"
+        assert cfg.nerf.train.chunksize <= cfg.nerf.ray_sampler.num_random_rays, msg
         ro_minibatches = get_minibatches(ro_batch, cfg.nerf.train.chunksize)
         rd_minibatches = get_minibatches(rd_batch, cfg.nerf.train.chunksize)
         tgt_pixel_minibatches = get_minibatches(tgt_pixel_batch, cfg.nerf.train.chunksize)
@@ -313,31 +327,28 @@ def train(rank: int, cfg: CfgNode) -> None:
         assert num_batches == len(rd_minibatches) == len(tgt_pixel_minibatches), msg
 
         coarse_loss, fine_loss, psnr = None, None, None
-        time_taken = None
         for j, (ro, rd, target_pixels) in enumerate(zip(ro_minibatches, rd_minibatches, tgt_pixel_minibatches)):
             then = time.time()
 
+            optimizer.zero_grad()
             # Pass through coarse model
             pts_coarse, z_vals_coarse = point_sampler.sample_uniform(ro, rd)
-            # print(f"Current iteration: {i}")
-            # print(f"Coarse points: {pts_coarse[0, :2, ...]}, {pts_coarse.shape}")
             radiance_field_coarse = nerf_forward_pass(models["coarse"], [embedder_xyz, embedder_dir], rd, pts_coarse)
-            # print(f"Radiance field coarse: {radiance_field_coarse[0, :2, ...]}, {radiance_field_coarse.shape}")
             (rgb_coarse, _, _, weights, _) = volume_render(radiance_field_coarse,
                                                            z_vals_coarse,
                                                            rd,
                                                            radiance_field_noise_std=cfg.nerf.train.radiance_field_noise_std,
                                                            white_background=cfg.nerf.train.white_background)
-            # print(f"RGB coarse: {rgb_coarse[:2, ...]}, {rgb_coarse.shape}")
+            print(f"rgb coarse: {rgb_coarse[:10, ...]}, {target_pixels[:10, ...]}, {rgb_coarse.shape}")
             coarse_loss = torch.nn.functional.mse_loss(rgb_coarse[..., :3], target_pixels[..., :3])
-            loss = coarse_loss
             psnr = mse2psnr(coarse_loss.item())
 
             # Pass through fine model
             fine_loss = None
             if hasattr(cfg.models, "fine"):
                 pts_fine, z_vals_fine = point_sampler.sample_pdf(ro, rd, weights[..., 1:-1], z_vals_coarse)
-                # print(f"Fine points: {pts_fine[0, :2, ...]}, {pts_fine.shape}")
+                # print(f"Fine points: {pts_fine[0, :10, ...]}, {pts_fine.shape}")
+                # print(f"Coarse points: {pts_coarse[0, :10, ...]}, {pts_coarse.shape}")
                 radiance_field_fine = nerf_forward_pass(models["fine"], [embedder_xyz, embedder_dir], rd, pts_fine)
                 # print(f"Radiance field fine: {radiance_field_fine[0, :2, ...]}, {radiance_field_fine.shape}")
                 (rgb_fine, _, _, _, _) = volume_render(radiance_field_fine,
@@ -345,28 +356,28 @@ def train(rank: int, cfg: CfgNode) -> None:
                                                        rd,
                                                        radiance_field_noise_std=cfg.nerf.train.radiance_field_noise_std,
                                                        white_background=cfg.nerf.train.white_background)
-                # print(f"rgb fine: {rgb_fine[:2, ...]}, {rgb_fine.shape}")
+
+                print(f"rgb fine: {rgb_fine[:10, ...]}, {target_pixels[:10, ...]}, {rgb_fine.shape}")
                 fine_loss = torch.nn.functional.mse_loss(rgb_fine[..., :3], target_pixels[..., :3])
-                loss += fine_loss
                 psnr = mse2psnr(fine_loss.item())
 
-            optimizer.zero_grad()
+            loss = coarse_loss + fine_loss
             loss.backward()
             optimizer.step()
             scheduler.step()
-
-            time_taken = time.time() - then
 
             i = iteration * num_batches + j
 
             if is_main_process(cfg.is_distributed) and i % cfg.experiment.print_every == 0:
                 writer.add_scalar("train/coarse_loss", coarse_loss.item(), i)
-                writer.add_scalar("train/fine_loss", fine_loss.item(), i)
                 writer.add_scalar("train/psnr", psnr, i)
                 writer.add_scalar("train/learning_rate", scheduler.get_last_lr()[0], i)
 
-                log_string = f"[TRAIN] Iter: {i:>8} Load Iter: {iteration:>8} Time taken: {time_taken:>4.4f} Learning rate: {scheduler.get_last_lr()[0]:4.4f} Coarse Loss: {coarse_loss.item():>4.4f} "
+                log_string = f"[TRAIN] Iter: {i:>8} "
+                log_string += f"Load Iter: {iteration:>8} Time taken: {time.time()-then:>4.4f} "
+                log_string += f"Learning rate: {scheduler.get_last_lr()[0]:4.4f} Coarse Loss: {coarse_loss.item():>4.4f} "
                 if hasattr(cfg.models, "fine"):
+                    writer.add_scalar("train/fine_loss", fine_loss.item(), i)
                     log_string += f"Fine Loss: {fine_loss.item():>4.4f} "
                 log_string += f"PSNR: {psnr:>4.4f}"
                 print(log_string)
@@ -384,11 +395,12 @@ def train(rank: int, cfg: CfgNode) -> None:
             # Parallel rendering of image for Validation
             if (i > 0 and i % cfg.experiment.validate_every == 0):
 
+                val_dataloader.sampler.set_epoch(iteration)
                 # Load data independently in all processes as a list of tuples
                 val_data = next(iter(val_dataloader))
 
                 # Broadcast validation data in rank 0 to all the processes
-                if cfg.is_distributed == True:
+                if cfg.is_distributed:
                     val_data = list(val_data.items())
                     torch.distributed.broadcast_object_list(val_data, 0)
                     val_data = dict(val_data)
@@ -414,7 +426,6 @@ def train(rank: int, cfg: CfgNode) -> None:
                         assert rgb_fine is not None, "Main process must contain rgb_fine"
 
                     target_pixels = val_data["color"].view(-1, 4)
-
                     coarse_loss = torch.nn.functional.mse_loss(rgb_coarse[..., :3], target_pixels[..., :3])
                     loss = coarse_loss
                     psnr = mse2psnr(coarse_loss.item())
@@ -439,8 +450,9 @@ def train(rank: int, cfg: CfgNode) -> None:
                         writer.add_images(
                             "val/rgb_fine_image", rgb_fine[..., :3], i, dataformats='NHWC'
                         )
-
-                    print(f"[VAL  ] Iter: {i:>8} Iteration: {iteration:>8} Time taken: {time.time() - val_then:>4.4f} Loss: {loss.item():>4.4f} PSNR: {psnr:>4.4f}")
+                    log_string = f"[VAL  ] Iter: {i:>8} Iteration: {iteration:>8}"
+                    log_string += f"Time taken: {time.time() - val_then:>4.4f} Loss: {loss.item():>4.4f} PSNR: {psnr:>4.4f}"
+                    print(log_string)
 
 
 def parallel_image_render(rank: int,
@@ -458,7 +470,6 @@ def parallel_image_render(rank: int,
     assert embedder_dir is not None, "Direction PositionalEmbedder is None "
 
     for _, model in models.items():
-        model.to(device)
         model.eval()
 
     with torch.no_grad():
@@ -495,7 +506,7 @@ def parallel_image_render(rank: int,
                                                            z_vals_coarse,
                                                            rd,
                                                            radiance_field_noise_std=cfg.nerf.validation.radiance_field_noise_std,
-                                                           white_background=cfg.nerf.train.white_background)
+                                                           white_background=cfg.nerf.validation.white_background)
             rgb_coarse_batches.append(rgb_coarse)
 
             # Pass through fine model
@@ -506,14 +517,14 @@ def parallel_image_render(rank: int,
                                                              z_vals_fine,
                                                              rd,
                                                              radiance_field_noise_std=cfg.nerf.validation.radiance_field_noise_std,
-                                                             white_background=cfg.nerf.train.white_background)
+                                                             white_background=cfg.nerf.validation.white_background)
                 rgb_fine_batches.append(rgb_fine)
 
         rgb_coarse_batches = torch.cat(rgb_coarse_batches, dim=0)
         if hasattr(cfg.models, "fine"):
             rgb_fine_batches = torch.cat(rgb_fine_batches, dim=0)
 
-        if cfg.is_distributed == False:
+        if not cfg.is_distributed:
             return rgb_coarse_batches, rgb_fine_batches
 
         # Pad image chunks to get equal chunksize for all_gather/gather
@@ -523,11 +534,8 @@ def parallel_image_render(rank: int,
         rgb_coarse_batches = torch.cat([rgb_coarse_batches, padded_rgb_coarse], dim=0)
         all_rgb_coarse_batches = [torch.zeros_like(rgb_coarse_batches) for _ in range(cfg.gpus)]
         torch.distributed.all_gather(all_rgb_coarse_batches, rgb_coarse_batches)
-        if is_main_process(cfg.is_distributed):
-            for i, size in enumerate(batchsize_per_process):
-                all_rgb_coarse_batches[i] = all_rgb_coarse_batches[i][:size, ...]
-            all_rgb_coarse_batches = torch.cat(all_rgb_coarse_batches, dim=0)
 
+        all_rgb_fine_batches = None
         if hasattr(cfg.models, "fine"):
             padded_rgb_fine = torch.zeros((padding_per_process[rank], rgb_fine_batches.shape[-1]),
                                           dtype=rgb_fine_batches.dtype,
@@ -535,15 +543,20 @@ def parallel_image_render(rank: int,
             rgb_fine_batches = torch.cat([rgb_fine_batches, padded_rgb_fine], dim=0)
             all_rgb_fine_batches = [torch.zeros_like(rgb_fine_batches) for _ in range(cfg.gpus)]
             torch.distributed.all_gather(all_rgb_fine_batches, rgb_fine_batches)
-            if is_main_process(cfg.is_distributed):
+
+        if is_main_process(cfg.is_distributed):
+            for i, size in enumerate(batchsize_per_process):
+                all_rgb_coarse_batches[i] = all_rgb_coarse_batches[i][:size, ...]
+            all_rgb_coarse_batches = torch.cat(all_rgb_coarse_batches, dim=0)
+
+            if hasattr(cfg.models, "fine"):
                 for i, size in enumerate(batchsize_per_process):
                     all_rgb_fine_batches[i] = all_rgb_fine_batches[i][:size, ...]
                 all_rgb_fine_batches = torch.cat(all_rgb_fine_batches, dim=0)
 
-    if is_main_process(cfg.is_distributed):
-        return all_rgb_coarse_batches, all_rgb_fine_batches
-    else:
-        return None, None
+            return all_rgb_coarse_batches, all_rgb_fine_batches
+        else:
+            return None, None
 
 
 def init_process(rank: int, fn: FunctionType, cfg: CfgNode, backend: str = "gloo"):
@@ -568,11 +581,13 @@ def main(cfg: CfgNode):
 
     """
     # # (Optional:) enable this to track autograd issues when debugging
-    torch.autograd.set_detect_anomaly(True)
+    # torch.autograd.set_detect_anomaly(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     _, device_ids = prepare_device(cfg.gpus, cfg.is_distributed)
 
-    if len(device_ids) > 1 and configargs.is_distributed == True:
+    if len(device_ids) > 1 and configargs.is_distributed:
         # TODO: Setup DataDistributedParallel
         print(f"Using {len(device_ids)} GPUs for training")
         mp.spawn(init_process, args=(train, cfg, "nccl"),

@@ -3,13 +3,13 @@ experiment:
     logdir: logs
     randomseed: 42
     iterations: 100000
-    validate_every: 500
+    validate_every: 100
     save_every: 5000
     print_every: 100
 
 dataset:
     type: BlenderNeRFDataset
-    basedir: /home/akashsharma/Documents/datasets/nerf_synthetic/lego/
+    basedir: /home/tkhurana/Documents/akash/datasets/nerf_synthetic/lego
     resolution_level: 2
     train_batch_size: 16
     val_batch_size: 1
@@ -36,7 +36,7 @@ optimizer:
 
 nerf:
     ray_sampler:
-        num_random_rays: 1024
+        num_random_rays: 32768
     point_sampler:
         num_coarse: 64
         num_fine: 128
@@ -53,10 +53,10 @@ nerf:
         include_input_dir: True
         log_sampling_dir: True
     train:
-        chunksize: 1024
+        chunksize: 4096
         white_background: False
         radiance_field_noise_std: 0.2
     validation:
-        chunksize: 4096
-        white_background: False
+        chunksize: 8192
+        white_background: True
         radiance_field_noise_std: 0.0

@@ -1,5 +1,5 @@
-import numpy as np
 import torch
+
 
 def cumprod_exclusive(tensor: torch.Tensor) -> torch.Tensor:
     r"""Mimick functionality of tf.math.cumprod(..., exclusive=True), as it isn't available in PyTorch.
@@ -23,6 +23,7 @@ def cumprod_exclusive(tensor: torch.Tensor) -> torch.Tensor:
     cumprod[..., 0] = 1.0
 
     return cumprod
+
 
 def volume_render(
     radiance_field,

@@ -1,4 +1,4 @@
-from typing import Tuple, Union, Literal
+from typing import Tuple, Literal
 from numpy.typing import DTypeLike
 import numpy as np
 import torch
@@ -79,7 +79,6 @@ class PointSampler(object):
             z_vals: [num_random_rays, num_samples, 3] z_vals along the ray
 
         """
-        num_random_rays = ro.shape[-2]
 
         # Calculate CDF using weights
         assert self.num_samples_coarse - 2 == weights.shape[-1], f"Weights size {weights.shape} should match {self.num_samples_coarse - 1}"
@@ -175,7 +174,6 @@ if __name__ == "__main__":
                                  dtype=intrinsic[0].dtype,
                                  device=device)
     pts, z_vals = point_sampler.sample_uniform(ray_origins, ray_directions)
-
 
     print(f"Uniform sampled points: {z_vals[0]}")
     # Take the z value from the depth image of the first left-top pixel
