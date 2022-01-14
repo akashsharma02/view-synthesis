@@ -74,16 +74,3 @@ def get_minibatches(inputs: torch.Tensor, chunksize: Optional[int] = 1024 * 8):
     `chunksize`.
     """
     return [inputs[i: i + chunksize] for i in range(0, inputs.shape[0], chunksize)]
-
-
-def meshgrid_xy(
-    tensor1: torch.Tensor, tensor2: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Mimick np.meshgrid(..., indexing="xy") in pytorch. torch.meshgrid only allows "ij" indexing.
-    :Function:
-      tensor1 (torch.Tensor): Tensor whose elements define the first dimension of the returned meshgrid.
-      tensor2 (torch.Tensor): Tensor whose elements define the second dimension of the returned meshgrid.
-    """
-    # TESTED
-    ii, jj = torch.meshgrid(tensor1, tensor2)
-    return ii.transpose(-1, -2), jj.transpose(-1, -2)

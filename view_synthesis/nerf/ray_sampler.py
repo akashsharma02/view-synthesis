@@ -3,8 +3,6 @@ from numpy.typing import DTypeLike
 import numpy as np
 import torch
 
-from view_synthesis.utils import meshgrid_xy
-
 
 class RaySampler(object):
 
@@ -32,13 +30,14 @@ class RaySampler(object):
         self.intrinsics = self.intrinsics.to(device)
         self.focal_length = self.intrinsics[..., 0, 0]
 
-        ii, jj = meshgrid_xy(
+        ii, jj = torch.meshgrid(
             torch.arange(
                 width, dtype=self.intrinsics.dtype, device=self.device
             ),
             torch.arange(
                 height, dtype=self.intrinsics.dtype, device=self.device
             ),
+            indexing='xy'
         )
         self.directions = torch.stack(
             [
