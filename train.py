@@ -96,8 +96,7 @@ def prepare_models(cfg: CfgNode) -> "OrderedDict[torch.nn.Module, Union[torch.nn
         num_encoding_fn_dir=cfg.nerf.embedder.num_encoding_fn_dir,
         include_input_dir=cfg.nerf.embedder.include_input_dir,
         use_viewdirs=cfg.nerf.embedder.use_viewdirs,
-    )
-    models["coarse"].to(rank)
+    ).to(rank)
 
     if hasattr(cfg.models, "fine"):
         models['fine'] = getattr(network_arch, cfg.models.fine.type)(
@@ -109,8 +108,7 @@ def prepare_models(cfg: CfgNode) -> "OrderedDict[torch.nn.Module, Union[torch.nn
             num_encoding_fn_dir=cfg.nerf.embedder.num_encoding_fn_dir,
             include_input_dir=cfg.nerf.embedder.include_input_dir,
             use_viewdirs=cfg.nerf.embedder.use_viewdirs,
-        )
-        models["fine"].to(rank)
+        ).to(rank)
 
     if cfg.is_distributed:
         models["coarse"] = ddp(models['coarse'], device_ids=[rank], output_device=rank)
@@ -248,20 +246,18 @@ def train(rank: int, cfg: CfgNode) -> None:
 
     """
     # Seed experiment for repeatability (Each process should sample different rays)
-    seed = (rank + 1) * cfg.experiment.randomseed
+    seed = (rank + 1) + cfg.experiment.randomseed
     np.random.seed(seed)
     torch.manual_seed(seed)
 
     # Set device and logdir_path
-    device, logdir_path = None, None
+    logdir_path, writer = None, None
     if is_main_process(cfg.is_distributed):
         logdir_path = prepare_experiment(cfg)
-        device = "cuda:0"
-    else:
-        device = f"cuda:{rank}"
-        torch.cuda.set_device(rank)
+        writer = SummaryWriter(logdir_path)
 
-    writer = SummaryWriter(logdir_path)
+    device = torch.device('cuda', rank)
+    torch.cuda.set_device(device)
 
     # Load Data
     train_dataloader, val_dataloader = prepare_dataloader(cfg)
@@ -338,9 +334,10 @@ def train(rank: int, cfg: CfgNode) -> None:
                                                            z_vals_coarse,
                                                            rd,
                                                            radiance_field_noise_std=cfg.nerf.train.radiance_field_noise_std,
-                                                           white_background=cfg.nerf.train.white_background)
-            print(f"rgb coarse: {rgb_coarse[:10, ...]}, {target_pixels[:10, ...]}, {rgb_coarse.shape}")
+                                                           white_background=cfg.nerf.white_background)
+            # print(f"rgb coarse: {rgb_coarse[:10, ...]}, {target_pixels[:10, ...]}, {rgb_coarse.shape}")
             coarse_loss = torch.nn.functional.mse_loss(rgb_coarse[..., :3], target_pixels[..., :3])
+            loss = coarse_loss
             psnr = mse2psnr(coarse_loss.item())
 
             # Pass through fine model
@@ -355,13 +352,13 @@ def train(rank: int, cfg: CfgNode) -> None:
                                                        z_vals_fine,
                                                        rd,
                                                        radiance_field_noise_std=cfg.nerf.train.radiance_field_noise_std,
-                                                       white_background=cfg.nerf.train.white_background)
+                                                       white_background=cfg.nerf.white_background)
 
-                print(f"rgb fine: {rgb_fine[:10, ...]}, {target_pixels[:10, ...]}, {rgb_fine.shape}")
+                # print(f"rgb fine: {rgb_fine[:10, ...]}, {target_pixels[:10, ...]}, {rgb_fine.shape}")
                 fine_loss = torch.nn.functional.mse_loss(rgb_fine[..., :3], target_pixels[..., :3])
+                loss += fine_loss
                 psnr = mse2psnr(fine_loss.item())
 
-            loss = coarse_loss + fine_loss
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -450,7 +447,7 @@ def train(rank: int, cfg: CfgNode) -> None:
                         writer.add_images(
                             "val/rgb_fine_image", rgb_fine[..., :3], i, dataformats='NHWC'
                         )
-                    log_string = f"[VAL  ] Iter: {i:>8} Iteration: {iteration:>8}"
+                    log_string = f"[VAL  ] Iter: {i:>8} Iteration: {iteration:>8} "
                     log_string += f"Time taken: {time.time() - val_then:>4.4f} Loss: {loss.item():>4.4f} PSNR: {psnr:>4.4f}"
                     print(log_string)
 
@@ -506,7 +503,7 @@ def parallel_image_render(rank: int,
                                                            z_vals_coarse,
                                                            rd,
                                                            radiance_field_noise_std=cfg.nerf.validation.radiance_field_noise_std,
-                                                           white_background=cfg.nerf.validation.white_background)
+                                                           white_background=cfg.nerf.white_background)
             rgb_coarse_batches.append(rgb_coarse)
 
             # Pass through fine model
@@ -517,7 +514,7 @@ def parallel_image_render(rank: int,
                                                              z_vals_fine,
                                                              rd,
                                                              radiance_field_noise_std=cfg.nerf.validation.radiance_field_noise_std,
-                                                             white_background=cfg.nerf.validation.white_background)
+                                                             white_background=cfg.nerf.white_background)
                 rgb_fine_batches.append(rgb_fine)
 
         rgb_coarse_batches = torch.cat(rgb_coarse_batches, dim=0)

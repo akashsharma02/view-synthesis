@@ -3,7 +3,7 @@ experiment:
     logdir: logs
     randomseed: 42
     iterations: 100000
-    validate_every: 100
+    validate_every: 500
     save_every: 5000
     print_every: 100
 
@@ -52,11 +52,10 @@ nerf:
         num_encoding_fn_dir: 4
         include_input_dir: True
         log_sampling_dir: True
+    white_background: False
     train:
         chunksize: 4096
-        white_background: False
         radiance_field_noise_std: 0.2
     validation:
-        chunksize: 8192
-        white_background: True
+        chunksize: 16384
         radiance_field_noise_std: 0.0

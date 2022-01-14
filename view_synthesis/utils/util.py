@@ -5,6 +5,7 @@ from pathlib import Path
 import torch.distributed as dist
 
 from view_synthesis.cfgnode import CfgNode
+import view_synthesis.datasets as datasets
 
 
 def prepare_device(n_gpus_to_use: int, is_distributed: bool) -> Tuple[torch.device, List[int]]:
@@ -52,6 +53,59 @@ def prepare_experiment(cfg: CfgNode):
         f.write(cfg.dump())
 
     return logdir_path
+
+
+def prepare_dataloader(cfg: CfgNode) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    """ Prepare the dataloader considering DataDistributedParallel
+
+    :function:
+        rank: Process rank. 0 == main process
+    :returns: TODO
+
+    """
+    dataset = getattr(datasets, cfg.dataset.type)(
+        cfg.dataset.basedir,
+        cfg.dataset.resolution_level)
+
+    train_size = int(len(dataset) * 0.75)
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size])
+
+    train_sampler = torch.utils.data.RandomSampler(
+        train_dataset,
+        replacement=True,
+        num_samples=cfg.experiment.iterations
+    )
+
+    val_sampler = torch.utils.data.RandomSampler(
+        val_dataset,
+        replacement=True,
+        num_samples=cfg.experiment.iterations
+    )
+
+    if cfg.is_distributed:
+        train_sampler = torch.utils.data.DistributedSampler(
+            train_dataset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            drop_last=False
+        )
+
+        val_sampler = torch.utils.data.DistributedSampler(
+            val_dataset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            drop_last=False
+        )
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=cfg.dataset.train_batch_size, shuffle=False, num_workers=0, sampler=train_sampler, pin_memory=False)
+
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=cfg.dataset.val_batch_size, shuffle=False, num_workers=0, sampler=val_sampler, pin_memory=False)
+
+    return train_dataloader, val_dataloader
 
 
 def mse2psnr(mse_val: float) -> float:
