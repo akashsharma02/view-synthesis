@@ -297,9 +297,10 @@ def train(rank: int, cfg: CfgNode) -> None:
     for iteration in range(start_iter, total_load_iterations):
 
         for _, model in models.items():
-            model.train()
+            model = model.train()
 
-        train_dataloader.sampler.set_epoch(iteration)
+        if cfg.is_distributed:
+            train_dataloader.sampler.set_epoch(iteration)
         train_data = next(iter(train_dataloader))
         for key, value in train_data.items():
             if torch.is_tensor(value):
@@ -307,13 +308,11 @@ def train(rank: int, cfg: CfgNode) -> None:
 
         ro_batch, rd_batch, select_inds = ray_sampler.sample(tform_cam2world=train_data["pose"])
         tgt_pixel_batch = train_data["color"].flatten(1, 2)
-        tgt_pixel_batch = [tgt_pixel_batch[i, select_inds[i], :] for i in range(cfg.dataset.train_batch_size)]
-        tgt_pixel_batch = torch.cat(tgt_pixel_batch, dim=0).reshape(-1, 4)
+        tgt_pixel_batch = [tgt_pixel_batch[k, select_inds[k], :] for k in range(cfg.dataset.train_batch_size)]
+        tgt_pixel_batch = torch.cat(tgt_pixel_batch, dim=0)
 
-        # print(ro_batch.shape, rd_batch.shape, tgt_pixel_batch.shape)
-        # Batching to reduce loading time
-        msg = "Chunksize needs to atleast be equal to the number of rays sampled from a single image"
-        assert cfg.nerf.train.chunksize <= cfg.nerf.ray_sampler.num_random_rays, msg
+        msg = "Chunksize needs to atleast be less than to the number of rays sampled from a single image"
+        assert cfg.nerf.train.chunksize <= cfg.nerf.ray_sampler.num_random_rays * cfg.dataset.train_batch_size, msg
         ro_minibatches = get_minibatches(ro_batch, cfg.nerf.train.chunksize)
         rd_minibatches = get_minibatches(rd_batch, cfg.nerf.train.chunksize)
         tgt_pixel_minibatches = get_minibatches(tgt_pixel_batch, cfg.nerf.train.chunksize)
@@ -322,11 +321,9 @@ def train(rank: int, cfg: CfgNode) -> None:
         msg = "Mismatch in batch length of ray origins, ray directions and target pixels"
         assert num_batches == len(rd_minibatches) == len(tgt_pixel_minibatches), msg
 
-        coarse_loss, fine_loss, psnr = None, None, None
         for j, (ro, rd, target_pixels) in enumerate(zip(ro_minibatches, rd_minibatches, tgt_pixel_minibatches)):
             then = time.time()
 
-            optimizer.zero_grad()
             # Pass through coarse model
             pts_coarse, z_vals_coarse = point_sampler.sample_uniform(ro, rd)
             radiance_field_coarse = nerf_forward_pass(models["coarse"], [embedder_xyz, embedder_dir], rd, pts_coarse)
@@ -335,7 +332,6 @@ def train(rank: int, cfg: CfgNode) -> None:
                                                            rd,
                                                            radiance_field_noise_std=cfg.nerf.train.radiance_field_noise_std,
                                                            white_background=cfg.nerf.white_background)
-            # print(f"rgb coarse: {rgb_coarse[:10, ...]}, {target_pixels[:10, ...]}, {rgb_coarse.shape}")
             coarse_loss = torch.nn.functional.mse_loss(rgb_coarse[..., :3], target_pixels[..., :3])
             loss = coarse_loss
             psnr = mse2psnr(coarse_loss.item())
@@ -344,21 +340,18 @@ def train(rank: int, cfg: CfgNode) -> None:
             fine_loss = None
             if hasattr(cfg.models, "fine"):
                 pts_fine, z_vals_fine = point_sampler.sample_pdf(ro, rd, weights[..., 1:-1], z_vals_coarse)
-                # print(f"Fine points: {pts_fine[0, :10, ...]}, {pts_fine.shape}")
-                # print(f"Coarse points: {pts_coarse[0, :10, ...]}, {pts_coarse.shape}")
                 radiance_field_fine = nerf_forward_pass(models["fine"], [embedder_xyz, embedder_dir], rd, pts_fine)
-                # print(f"Radiance field fine: {radiance_field_fine[0, :2, ...]}, {radiance_field_fine.shape}")
                 (rgb_fine, _, _, _, _) = volume_render(radiance_field_fine,
                                                        z_vals_fine,
                                                        rd,
                                                        radiance_field_noise_std=cfg.nerf.train.radiance_field_noise_std,
                                                        white_background=cfg.nerf.white_background)
-
-                # print(f"rgb fine: {rgb_fine[:10, ...]}, {target_pixels[:10, ...]}, {rgb_fine.shape}")
                 fine_loss = torch.nn.functional.mse_loss(rgb_fine[..., :3], target_pixels[..., :3])
-                loss += fine_loss
                 psnr = mse2psnr(fine_loss.item())
 
+            loss += fine_loss
+
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -372,7 +365,7 @@ def train(rank: int, cfg: CfgNode) -> None:
 
                 log_string = f"[TRAIN] Iter: {i:>8} "
                 log_string += f"Load Iter: {iteration:>8} Time taken: {time.time()-then:>4.4f} "
-                log_string += f"Learning rate: {scheduler.get_last_lr()[0]:4.4f} Coarse Loss: {coarse_loss.item():>4.4f} "
+                log_string += f"Learning rate: {scheduler.get_last_lr()[0]:0.8f} Coarse Loss: {coarse_loss.item():>4.4f} "
                 if hasattr(cfg.models, "fine"):
                     writer.add_scalar("train/fine_loss", fine_loss.item(), i)
                     log_string += f"Fine Loss: {fine_loss.item():>4.4f} "
@@ -392,7 +385,8 @@ def train(rank: int, cfg: CfgNode) -> None:
             # Parallel rendering of image for Validation
             if (i > 0 and i % cfg.experiment.validate_every == 0):
 
-                val_dataloader.sampler.set_epoch(iteration)
+                if cfg.is_distributed:
+                    val_dataloader.sampler.set_epoch(iteration)
                 # Load data independently in all processes as a list of tuples
                 val_data = next(iter(val_dataloader))
 
